@@ -185,7 +185,7 @@ def _draw_two_column_rows(
 
 def _dominant_band(profile, x_width: float, x_unit: str) -> tuple[str, float]:
     matrix = profile.percent
-    if matrix.empty or not np.isfinite(matrix.to_numpy(dtype=float)).any():
+    if matrix.empty or not np.isfinite(matrix.to_numpy(dtype=float)).any() or not (matrix.to_numpy(dtype=float) > 0).any():
         return "Not available", 0.0
     values = matrix.to_numpy(dtype=float)
     flat_index = int(np.nanargmax(values))
@@ -200,7 +200,7 @@ def _dominant_band(profile, x_width: float, x_unit: str) -> tuple[str, float]:
     return f"{x_text} / {draft_start:g}-<{draft_start + 1:g} m", share
 
 
-def _draw_profile_distribution(
+def _draw_profile_heatmap(
     pdf: canvas.Canvas,
     profile,
     x: float,
@@ -209,68 +209,72 @@ def _draw_profile_distribution(
     title: str,
     x_axis_title: str,
     band_width: float,
-    colour,
+    common_max_pct: float,
 ) -> None:
-    """Draw a compact bar graph of propelling-hour share by operating band."""
-    matrix = profile.percent.copy()
+    """Draw the complete fixed-bin speed/draught or power/draught matrix."""
+    matrix = profile.percent.copy().apply(pd.to_numeric, errors="coerce")
     pdf.setFillColor(DARK)
     pdf.setFont(FONT_BOLD, 7.8)
     pdf.drawString(x, top_y, title)
-    if matrix.empty:
+    if matrix.empty or not (matrix.to_numpy(dtype=float) > 0).any():
         pdf.setFont(FONT, 7.2)
         pdf.setFillColor(MID_GREY)
-        pdf.drawString(x, top_y - 18, "No operating-profile data available")
+        pdf.drawString(x, top_y - 30, "No eligible operating-profile data")
         return
+    values = matrix.to_numpy(dtype=float)
+    n_rows, n_columns = values.shape
+    peak = np.unravel_index(int(np.nanargmax(values)), values.shape)
+    plot_x = x + 24
+    plot_top = top_y - 15
+    plot_width = width - 28
+    plot_height = 94
+    cell_width = plot_width / n_columns
+    cell_height = plot_height / n_rows
+    empty = (250, 251, 253)
+    pale = (221, 237, 247)
+    dark = (31, 93, 157)
+    for row in range(n_rows):
+        for column in range(n_columns):
+            value = values[row, column]
+            if not np.isfinite(value) or value <= 0:
+                rgb = empty
+            else:
+                ratio = min(value / max(common_max_pct, 1e-9), 1.0) ** 0.7
+                rgb = tuple(int(a + (b - a) * ratio) for a, b in zip(pale, dark))
+            cell_x = plot_x + column * cell_width
+            cell_y = plot_top - (row + 1) * cell_height
+            pdf.setFillColor(colors.Color(*(channel / 255 for channel in rgb)))
+            pdf.setStrokeColor(colors.white)
+            pdf.setLineWidth(0.35)
+            pdf.rect(cell_x, cell_y, cell_width, cell_height, fill=1, stroke=1)
+    # An amber frame marks the cell with the greatest share of eligible hours.
+    pdf.setStrokeColor(colors.HexColor("#D28B00"))
+    pdf.setLineWidth(1.8)
+    pdf.rect(
+        plot_x + peak[1] * cell_width - 0.3,
+        plot_top - (peak[0] + 1) * cell_height - 0.3,
+        cell_width + 0.6, cell_height + 0.6, fill=0, stroke=1,
+    )
 
-    totals = matrix.sum(axis=0).astype(float)
-    active = np.where(totals.to_numpy() > 0)[0]
-    if not len(active):
-        pdf.setFont(FONT, 7.2)
-        pdf.setFillColor(MID_GREY)
-        pdf.drawString(x, top_y - 18, "No operating-profile data available")
-        return
-
-    totals = totals.iloc[active[0] : active[-1] + 1]
-    values = totals.to_numpy(dtype=float)
-    maximum = max(float(values.max()), 1.0)
-    y_max = max(10.0, math.ceil(maximum / 10.0) * 10.0)
-    plot_x = x + 28
-    plot_y = top_y - 67
-    plot_width = width - 34
-    plot_height = 48
-
-    pdf.setStrokeColor(colors.HexColor("#D9DEE7"))
     pdf.setFillColor(MID_GREY)
-    pdf.setFont(FONT, 5.4)
-    for tick in (0, y_max / 2, y_max):
-        tick_y = plot_y + plot_height * tick / y_max
-        pdf.line(plot_x, tick_y, plot_x + plot_width, tick_y)
-        pdf.drawRightString(plot_x - 3, tick_y - 2, f"{tick:.0f}%")
-
-    slot_width = plot_width / max(len(values), 1)
-    bar_width = max(2.0, slot_width * 0.66)
-    pdf.setFillColor(colour)
-    for index, value in enumerate(values):
-        bar_height = plot_height * max(value, 0.0) / y_max
-        bar_x = plot_x + index * slot_width + (slot_width - bar_width) / 2
-        pdf.rect(bar_x, plot_y, bar_width, bar_height, fill=1, stroke=0)
-
-    labels = list(totals.index)
-    label_step = max(1, math.ceil(len(labels) / 6))
-    pdf.setFillColor(MID_GREY)
-    pdf.setFont(FONT, 5.4)
-    for index in range(0, len(labels), label_step):
-        start = float(labels[index])
-        label = f"{start:,.0f}" if band_width >= 100 else f"{start:g}"
-        pdf.drawCentredString(plot_x + (index + 0.5) * slot_width, plot_y - 7, label)
-
-    pdf.setFont(FONT_BOLD, 5.9)
-    pdf.drawCentredString(plot_x + plot_width / 2, plot_y - 15, x_axis_title)
-    pdf.saveState()
-    pdf.translate(x + 7, plot_y + plot_height / 2)
-    pdf.rotate(90)
-    pdf.drawCentredString(0, 0, "Propelling hours (%)")
-    pdf.restoreState()
+    pdf.setFont(FONT, 5.1)
+    for row, label in enumerate(matrix.index):
+        pdf.drawRightString(plot_x - 3, plot_top - (row + 0.5) * cell_height - 2, str(label))
+    label_step = max(1, math.ceil(n_columns / 6))
+    for column in range(0, n_columns, label_step):
+        label = float(matrix.columns[column])
+        number = f"{label/1000:g}k" if band_width >= 1000 and label >= 1000 else f"{label:g}"
+        pdf.drawCentredString(plot_x + (column + 0.5) * cell_width, plot_top - plot_height - 8, number)
+    pdf.setFont(FONT_BOLD, 5.7)
+    pdf.drawCentredString(plot_x + plot_width / 2, plot_top - plot_height - 17, x_axis_title)
+    main_band, main_share = _dominant_band(profile, band_width, "kW" if band_width >= 100 else "kn")
+    pdf.setFillColor(AMBER)
+    pdf.setFont(FONT_BOLD, 6.0)
+    main_label = f"Main: {main_band} ({main_share:.1f}%)"
+    if stringWidth(main_label, FONT_BOLD, 6.0) > width:
+        _draw_wrapped(pdf, main_label, x, top_y - 139, width, FONT_BOLD, 6.0, 7, AMBER, max_lines=1)
+    else:
+        pdf.drawString(x, top_y - 139, main_label)
 
 
 def _draw_monthly_line_chart(
@@ -416,21 +420,9 @@ def build_a4_profile_report(
     if prepared_by.strip():
         pdf.drawRightString(width - margin, meta_y, f"Prepared by: {prepared_by.strip()[:55]}")
 
-    pdf.setFillColor(colors.HexColor("#FFF4D6"))
-    pdf.setStrokeColor(colors.HexColor("#E6B94A"))
-    callout_y = meta_y - 39
-    pdf.roundRect(margin, callout_y, content_width, 22, 4, fill=1, stroke=1)
-    pdf.setFillColor(AMBER)
-    pdf.setFont(FONT_BOLD, 8)
-    pdf.drawString(
-        margin + 8,
-        callout_y + 8,
-        "The fuel saving is an input assumption; this report does not measure post-retrofit performance.",
-    )
-
     total_hours = float(overall.get("total_hours", 0.0) or 0.0)
     analysis_days = total_hours / 24 if total_hours > 0 else float("nan")
-    card_y = callout_y - 70
+    card_y = meta_y - 74
     card_gap = 6
     card_width = (content_width - 3 * card_gap) / 4
     card_values = [
@@ -450,20 +442,46 @@ def build_a4_profile_report(
             value,
         )
 
-    speed_band, speed_share = _dominant_band(speed_profile, 1.0, "kn")
-    power_band, power_share = _dominant_band(power_profile, 1_000.0, "kW")
-
     section_y = card_y - 24
-    _draw_section_title(pdf, "Operating profile", margin, section_y)
+    _draw_section_title(pdf, "Speed-draught and engine power-draught profiles", margin, section_y)
     operating_rows = [
-        ("Mean reported interval STW", _number(overall.get("avg_speed_knots"), 2, " kn")),
         ("Highest interval-average STW", _number(overall.get("max_noon_speed_knots"), 2, " kn")),
-        ("Propelling hours / elapsed hours", _number(overall.get("working_ratio_pct"), 1, "%")),
         ("Highest reported main-engine power", _number(overall.get("max_noon_me_output_kw"), 0, " kW")),
-        ("Most frequent STW/draught band", f"{speed_band} ({speed_share:.1f}%)"),
-        ("Most frequent power/draught band", f"{power_band} ({power_share:.1f}%)"),
     ]
     table_bottom = _draw_two_column_rows(pdf, operating_rows, margin, section_y - 13, content_width)
+    heatmap_top = table_bottom - 12
+    heatmap_gap = 11
+    heatmap_width = (content_width - heatmap_gap) / 2
+    heatmaps = [
+        (speed_profile, margin, heatmap_width, "STW / mean draught", "STW (kn)", 1.0),
+        (power_profile, margin + heatmap_width + heatmap_gap, heatmap_width,
+         "M/E power / mean draught", "M/E power (kW)", 1000.0),
+    ]
+    peaks = [
+        float(np.nanmax(item[0].percent.to_numpy(dtype=float)))
+        for item in heatmaps if not item[0].percent.empty
+        and np.isfinite(item[0].percent.to_numpy(dtype=float)).any()
+    ]
+    common_max_pct = max(peaks, default=1.0)
+    for profile, plot_x, plot_width, title, axis_title, band_width in heatmaps:
+        _draw_profile_heatmap(
+            pdf, profile, plot_x, heatmap_top, plot_width, title,
+            axis_title, band_width, common_max_pct,
+        )
+    caption = "Darker cells = more eligible propelling hours; amber = most frequent condition."
+    power_columns = power_profile.percent.columns
+    max_reported_power = float(overall.get("max_noon_me_output_kw", float("nan")))
+    if len(power_columns) and math.isfinite(max_reported_power):
+        upper_power_bin = float(power_columns[-1]) + 1000
+        if max_reported_power >= upper_power_bin:
+            caption += (f" Power map ends at <{upper_power_bin:,.0f} kW; "
+                        f"max {max_reported_power:,.0f} kW is outside.")
+    pdf.setFillColor(MID_GREY)
+    pdf.setFont(FONT, 6.2)
+    if stringWidth(caption, FONT, 6.2) > content_width:
+        raise ValueError("Heatmap range note is too long for the A4 report")
+    pdf.drawString(margin, heatmap_top - 152, caption)
+    table_bottom = heatmap_top - 155
 
     equivalent_fuel = float(fuel.get("total_vlsfo_equivalent_mt", 0.0) or 0.0)
     raw_fuel = float(fuel.get("total_raw_mt", 0.0) or 0.0)
@@ -474,11 +492,11 @@ def build_a4_profile_report(
         annual_cost_saving = float(payback["annual_gross_saving_usd"])
 
     section_y = table_bottom - 18
-    _draw_section_title(pdf, "Main-engine fuel and illustrative saving", margin, section_y)
+    _draw_section_title(pdf, "M/E fuel consumption and assumed saving", margin, section_y)
     fuel_rows = [
         ("Reported M/E fuel, all grades", _number(raw_fuel, 2, " t")),
         ("M/E fuel, VLSFO-energy equivalent", _number(equivalent_fuel, 2, " t")),
-        ("Illustrative period fuel reduction", _number(period_saving, 2, " t equiv.")),
+        ("Assumed FOC Saving Reduction", _number(period_saving, 2, " t equiv.")),
         ("Illustrative annual fuel-cost saving", f"US$ {_number(annual_cost_saving, 0)}/year"),
     ]
     table_bottom = _draw_two_column_rows(pdf, fuel_rows, margin, section_y - 13, content_width)
@@ -530,57 +548,13 @@ def build_a4_profile_report(
         monthly_chart_height, "Monthly mean reported interval STW", " kn",
     )
 
-    methodology_y = 38
-    invalid_months = (
-        monthly.loc[~monthly["propelling_share_valid"].fillna(False), "month"]
-        if not monthly.empty and "propelling_share_valid" in monthly
-        else pd.Series(dtype="datetime64[ns]")
-    )
-    warnings = (
-        f"Monthly propelling share unavailable for {', '.join(pd.to_datetime(invalid_months).dt.strftime('%b %Y'))}; "
-        "check overlapping reports or missing elapsed-time coverage. "
-        if not invalid_months.empty else ""
-    )
-    override = bool(payback and payback.get("annual_saving_overridden"))
-    source_note = (
-        "Annual cost uses the user-entered annual fuel saving. " if override else
-        "Annual cost scales report-period fuel to 365 days. "
-    )
-    basis_note = (
-        "Band percentages are shares of eligible propelling hours. Main-engine fuel is normalised by lower calorific value "
-        "to a VLSFO energy-equivalent mass; actual grade quantities are separate. "
-        + source_note
-        + "Constant operations, fuel price and OPEX are assumed; discounting and other retrofit costs are excluded. "
-        "D/G, boiler, cylinder oil and non-propelling fuel are excluded. " + warnings
-    )
-    section_y = chart_top - monthly_chart_height - 10
-    if section_y < methodology_y + 85:
-        raise ValueError("A4 report content would overlap the method and limitations box")
-    pdf.setFillColor(PALE_BLUE)
-    pdf.setStrokeColor(LINE)
-    pdf.roundRect(margin, methodology_y, content_width, 78, 4, fill=1, stroke=1)
-    pdf.setFillColor(NAVY)
-    pdf.setFont(FONT_BOLD, 7.4)
-    pdf.drawString(margin + 8, methodology_y + 65, "BASIS AND LIMITATIONS")
-    note_bottom = _draw_wrapped(
-        pdf,
-        basis_note,
-        margin + 8,
-        methodology_y + 53,
-        content_width - 16,
-        size=6.8,
-        leading=8.1,
-        colour=DARK,
-        max_lines=5,
-    )
+    chart_bottom = chart_top - monthly_chart_height
+    if chart_bottom < 42:
+        raise ValueError("A4 report charts would overlap the footer")
     if management_comment.strip():
-        comment_bottom = _draw_wrapped(
-            pdf, f"Comment: {management_comment.strip()}", margin + 8,
-            note_bottom - 1, content_width - 16, font=FONT_ITALIC,
-            size=6.5, leading=7.4, colour=MID_GREY, max_lines=1,
-        )
-        if comment_bottom < methodology_y + 2:
-            raise ValueError("A4 report comment does not fit in the limitations box")
+        _draw_wrapped(pdf, f"Comment: {management_comment.strip()}", margin,
+                      39, content_width, font=FONT_ITALIC, size=6.5,
+                      leading=7.4, colour=MID_GREY, max_lines=1)
 
     pdf.setFillColor(MID_GREY)
     pdf.setFont(FONT, 6.7)
