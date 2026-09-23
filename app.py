@@ -1,850 +1,1072 @@
-"""V9.11: guided package-level post-dry-dock FOC assessment."""
 from __future__ import annotations
 
-import json
-from pathlib import Path
+import io
+import math
 
-import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
-from foc_audit import build_report_ledger, report_comparison
-from foc_explain import fuel_summary, selection_counts
-from foc_exports import (_actual_expected_scatter, _excel_export, _fmt,
-                         _support_scatter, _validation_table)
-from foc_interpret import actual_expected_comment, operating_support_comment
-from foc_report import printable_report
-from foc_setup import render_setup
-from foc_visuals import assessment_story_figure, figure_png
-
-st.set_page_config(
-    page_title="MIPD | Package-level post-dry-dock FOC assessment",
-    page_icon="M",
-    layout="wide",
+from profile_processing import (
+    EXCEL_POWER_EDGES,
+    EXCEL_SPEED_EDGES,
+    REPORT_NAMES,
+    ParsedReport,
+    build_excel_data_sum,
+    excel_overall_summary,
+    fuel_consumption_summary,
+    make_excel_profile,
+    mapping_table,
+    monthly_summary_excel,
+    parse_all_report_files,
+    profile_segments_from_data_sum,
+    profile_with_totals,
+    sea_temperature_audit,
+    validate_vessel_consistency,
+    VesselValidationError,
 )
+from profile_report import build_a4_profile_report, safe_report_filename
 
 
-CONCLUSION_GUIDE = pd.DataFrame(
-    [
-        {
-            "Conclusion": "Supported (prototype screening)",
-            "Plain-language meaning": "The result passed the prototype's strongest data, model-validation, comparability and direction checks.",
-            "Appropriate use": "Internal engineering screening; not certified or contractual evidence.",
-        },
-        {
-            "Conclusion": "Indicative",
-            "Plain-language meaning": "The validated model and same-route data support a limited engineering estimate.",
-            "Appropriate use": "Early engineering estimate; continue monitoring.",
-        },
-        {
-            "Conclusion": "Preliminary",
-            "Plain-language meaning": "The model passed validation, but the operating comparison or amount of evidence remains limited.",
-            "Appropriate use": "Do not use for a guarantee, investment approval or contractual claim.",
-        },
-        {
-            "Conclusion": "Unstable",
-            "Plain-language meaning": "Reasonable alternative analyses changed the result between saving and higher FOC.",
-            "Appropriate use": "Do not claim saving or deterioration; review the data and operating conditions.",
-        },
-        {
-            "Conclusion": "Inconclusive",
-            "Plain-language meaning": "The model, data or operating support cannot support an interpretable percentage.",
-            "Appropriate use": "Collect or correct the missing evidence before reassessment.",
-        },
-    ]
-)
+st.set_page_config(page_title="Vessel Operating Profile & Payback Analysis", layout="wide")
 
 
-def assessment_verdict(result):
-    return {
-        "Supported (prototype screening)": "Supported for prototype engineering screening",
-        "Indicative": "Indicative result - use with stated limitations",
-        "Preliminary": "Preliminary result - more comparable evidence required",
-        "Unstable": "Direction-sensitive result - do not interpret the percentage",
-        "Inconclusive": "Inconclusive - model or data not adequate for interpretation",
-    }.get(result.get("evidence_tier"), "Assessment status unavailable")
+def uploaded_bytes(uploaded_file) -> bytes:
+    uploaded_file.seek(0)
+    return uploaded_file.read()
 
 
-def business_decision(result):
-    """Translate the prototype evidence tier into an honest user action."""
-    return {
-        "Supported (prototype screening)": (
-            "Use the estimate as engineering screening evidence for the stated operating scope. "
-            "Commercial or contractual verification still requires an agreed measurement protocol."
-        ),
-        "Indicative": (
-            "Use the estimate as an indicative engineering result for the stated operating scope. "
-            "Continue monitoring before using it for an investment, guarantee or contractual claim."
-        ),
-        "Preliminary": (
-            "Do not use this estimate for a commercial decision yet. Collect more comparable post-DD "
-            "reports or complete the missing operational evidence."
-        ),
-        "Unstable": (
-            "Do not claim saving or deterioration. The estimated direction changed during the "
-            "automatic stability checks; review the flagged data and operating conditions."
-        ),
-        "Inconclusive": (
-            "Do not make a saving claim. The available data does not support a usable package-level estimate."
-        ),
-    }.get(result.get("evidence_tier"), "No decision guidance is available.")
+@st.cache_data(show_spinner=False)
+def parse_cached(content: bytes):
+    return parse_all_report_files(content)
 
 
-def plain_language_conclusion(result):
-    """Translate the numeric estimate and evidence tier for a non-specialist."""
-    effect = result.get("improvement_pct")
-    tier = str(result.get("evidence_tier") or "Inconclusive")
-    if effect is None or not np.isfinite(effect):
-        effect_text = "The app could not calculate a dependable package-level fuel difference."
-    elif tier == "Inconclusive":
-        effect_text = (
-            f"The app calculated a numerical difference of {effect:.2f}%, but the pre-DD model or "
-            "available data did not pass the minimum checks. Do not interpret this percentage as a "
-            "supported saving or deterioration result."
-        )
-    elif tier == "Unstable":
-        effect_text = (
-            f"The primary calculation produced {effect:.2f}%, but reasonable alternative analyses "
-            "changed the direction of the result. Do not interpret the percentage as a saving or "
-            "deterioration conclusion."
-        )
-    elif effect >= 0:
-        effect_text = (
-            f"Across the comparable reports used, the vessel recorded approximately {effect:.2f}% "
-            "less fuel than the pre-dry-dock model expected."
-        )
-    else:
-        effect_text = (
-            f"Across the comparable reports used, the vessel recorded approximately {abs(effect):.2f}% "
-            "more fuel than the pre-dry-dock model expected. This does not by itself prove that dry "
-            "docking caused poorer performance."
-        )
-    reasons = []
-    if result.get("comparison_basis") == "Expanded cross-route":
-        reasons.append("the same-route comparison was insufficient, so different routes were included")
-    if result.get("flagged_foc_rows", 0):
-        reasons.append(f"{result['flagged_foc_rows']} gross FOC report(s) require engineering review")
-    if result.get("stability_status") == "Unstable":
-        reasons.append("the estimated direction changed during sensitivity checks")
-    if result.get("coverage_pct", 0) < 70:
-        reasons.append("less than 70% of eligible post-dry-dock fuel was represented")
-    reason_text = (
-        " The conclusion is limited because " + "; ".join(reasons) + "."
-        if reasons else ""
+def report_card(uploaded_file, report_type: str) -> ParsedReport | None:
+    if uploaded_file is None:
+        st.info(f"Upload a {REPORT_NAMES[report_type]} report.")
+        return None
+    reports, errors = parse_cached(uploaded_bytes(uploaded_file))
+    if report_type in errors:
+        st.error(errors[report_type])
+        return None
+    report = reports[report_type]
+
+    st.success(
+        f"Detected {REPORT_NAMES[report_type]} | sheet: {report.sheet_name} | "
+        f"confidence: {report.confidence:.0%}"
     )
-    return tier, effect_text + reason_text
+    if report.missing:
+        st.error("This report cannot be processed until its missing required headers are restored.")
+    for warning in report.warnings:
+        st.warning(warning)
+    with st.expander("Show detected column mapping"):
+        st.dataframe(mapping_table(report), hide_index=True, use_container_width=True)
+    return report
 
 
-def show_conclusion_guide():
-    st.markdown("**Use the conclusion status to decide whether the percentage can be interpreted.**")
-    st.dataframe(CONCLUSION_GUIDE, hide_index=True, width="stretch")
-
-
-def comparison_method_label(result):
-    return {
-        "Strict same-route": "Same-route comparison (preferred)",
-        "Expanded cross-route": "Cross-route comparison (fallback)",
-    }.get(result.get("comparison_basis"), "No usable comparison")
-
-
-def comparison_selection_table(result, settings):
-    minimum_reports = int(settings.get("minimum_supported_after", 10))
-    strict_rows = int(result.get("strict_supported_after_rows") or 0)
-    expanded_rows = int(result.get("expanded_supported_after_rows") or 0)
-    strict_coverage = float(result.get("strict_coverage_pct") or 0.0)
-    expanded_coverage = float(result.get("expanded_coverage_pct") or 0.0)
-    selected = result.get("comparison_basis")
-    strict_ready = strict_rows >= minimum_reports and strict_coverage >= 40.0
-    expanded_ready = expanded_rows >= minimum_reports and expanded_coverage >= 40.0
-    return pd.DataFrame(
-        [
-            {
-                "Comparison option": "Same-route comparison",
-                "Condition-matching rule": "Same route and operating leg; comparable STW and displacement",
-                "Comparable post-DD reports": strict_rows,
-                "Eligible post-DD fuel represented": _fmt(strict_coverage, 1, "%"),
-                "Outcome": (
-                    "Selected"
-                    if selected == "Strict same-route"
-                    else f"Insufficient: below {minimum_reports} reports or 40% coverage"
-                ),
-            },
-            {
-                "Comparison option": "Cross-route fallback",
-                "Condition-matching rule": "Different routes allowed; same operating leg and comparable STW/displacement",
-                "Comparable post-DD reports": expanded_rows,
-                "Eligible post-DD fuel represented": _fmt(expanded_coverage, 1, "%"),
-                "Outcome": (
-                    "Selected fallback"
-                    if selected == "Expanded cross-route" and expanded_ready
-                    else "Fallback also insufficient"
-                    if selected == "Expanded cross-route"
-                    else "Not required"
-                ),
-            },
-        ]
-    )
-
-
-def show_comparison_selection(result, settings):
-    minimum_reports = int(settings.get("minimum_supported_after", 10))
-    selected = result.get("comparison_basis")
-    strict_rows = int(result.get("strict_supported_after_rows") or 0)
-    strict_coverage = float(result.get("strict_coverage_pct") or 0.0)
-    st.dataframe(
-        comparison_selection_table(result, settings),
-        hide_index=True,
-        width="stretch",
-    )
-    if selected == "Strict same-route":
-        st.info(
-            f"The same-route comparison met the minimum calculation floor of {minimum_reports} "
-            "comparable post-DD reports and 40% fuel coverage."
-        )
-    elif selected == "Expanded cross-route":
-        st.warning(
-            f"The same-route comparison produced {strict_rows} comparable reports and "
-            f"{strict_coverage:.1f}% fuel coverage, below the minimum floor of {minimum_reports} "
-            "reports and 40% coverage. The app therefore used different routes while retaining "
-            "the same operating leg and vessel-specific STW/displacement support test. "
-            "This fallback cannot exceed Preliminary."
-        )
-    st.caption(
-        "Both options first require Beaufort <=4 and at least 18 propelling hours. The support "
-        "test then checks whether each post-DD STW/displacement condition was represented in "
-        "the relevant pre-DD data."
-    )
-
-
-def methods_used_table(result):
-    features = result.get("numeric_features", [])
-    predictors = "STW and displacement" if "LogDisplacementRatio" in features else "STW"
-    return pd.DataFrame(
-        [
-            {
-                "Assessment step": "Calculate each noon report",
-                "Data used": "M/E fuel by grade, LCV, LOG distance and propelling hours",
-                "Method used": "VLSFO-equivalent 24-hour FOC and STW calculations",
-                "Output": "FOC and STW for each report",
-            },
-            {
-                "Assessment step": "Predict expected post-DD FOC",
-                "Data used": f"Valid pre-DD {predictors}",
-                "Method used": result.get("selected_ml_model") or "Huber ML",
-                "Output": "Expected FOC at each comparable post-DD condition",
-            },
-            {
-                "Assessment step": "Compare with a public benchmark",
-                "Data used": "The same pre-DD validation and comparable post-DD reports",
-                "Method used": "Cubic-speed benchmark: FOC = a x STW^3",
-                "Output": "Benchmark prediction error and benchmark saving",
-            },
-            {
-                "Assessment step": "Select comparable post-DD data",
-                "Data used": "Route, operating leg, STW and displacement",
-                "Method used": comparison_method_label(result),
-                "Output": "Post-DD reports included in the fuel comparison",
-            },
-            {
-                "Assessment step": "Calculate package saving",
-                "Data used": "Expected FOC, reported FOC and propelling hours",
-                "Method used": "Propelling-hour-weighted interval fuel aggregation",
-                "Output": "Package-level FOC saving percentage",
-            },
-        ]
-    )
-
-
-def assessment_data_table(saved):
-    result = saved["result"]
-    counts = selection_counts(saved["period_data"], saved["eligible"], result)
-    return pd.DataFrame(
-        [
-            {
-                "Data stage": "Within selected assessment dates",
-                "Pre-DD reports": counts["pre_raw"],
-                "Post-DD reports": counts["post_raw"],
-                "Purpose": "Available before common operating filters",
-            },
-            {
-                "Data stage": "Passed common operating filters",
-                "Pre-DD reports": counts["pre_eligible"],
-                "Post-DD reports": counts["post_eligible"],
-                "Purpose": "Valid for ML training or comparability testing",
-            },
-            {
-                "Data stage": "Used in the assessment",
-                "Pre-DD reports": result.get("before_rows", 0),
-                "Post-DD reports": counts["supported"],
-                "Purpose": "Trained the ML model or contributed to the saving",
-            },
-        ]
-    )
-
-
-def main_filter_reasons(saved, limit=3):
-    ledger = build_report_ledger(
-        saved["period_data"], saved["eligible"], saved["result"], saved["settings"]
-    )
-    reasons = (
-        ledger.loc[
-            ledger["Assessment use"].eq("Excluded by operating filters"), "Reason"
-        ]
-        .fillna("")
-        .astype(str)
-        .str.split("; ")
-        .explode()
-        .str.strip()
-    )
-    counts = reasons.loc[reasons.ne("")].value_counts().head(limit)
-    return [f"{reason} ({count})" for reason, count in counts.items()]
-
-
-def evidence_checklist(saved):
-    result, settings = saved["result"], saved["settings"]
-    validation = result.get("validation", {})
-    mape = validation.get("huber", {}).get("mape_pct")
-    bias = validation.get("huber", {}).get("bias_pct")
-    placebo = result.get("placebo", {})
-    dominant = result.get("service_leg_summary", pd.DataFrame())
-    dominant_share = (
-        float(dominant.iloc[0]["FuelSharePct"])
-        if isinstance(dominant, pd.DataFrame) and not dominant.empty
-        else None
-    )
-    documentation_complete = bool(settings.get("documentation_complete"))
-    return pd.DataFrame(
-        [
-            {
-                "Evidence check": "Pre-DD training data",
-                "Outcome": "Pass" if result.get("before_rows", 0) >= settings.get("minimum_train_rows", 60) else "Review",
-                "What it means": f"{result.get('before_rows', 0)} reports used",
-            },
-            {
-                "Evidence check": "Chronological prediction error",
-                "Outcome": "Pass" if mape is not None and mape <= 12 and bias is not None and abs(bias) <= 8 else "Fail - result is Inconclusive",
-                "What it means": f"MAPE {_fmt(mape, 2, '%')} (limit 12%); bias {_fmt(bias, 2, '%')} (absolute limit 8%)",
-            },
-            {
-                "Evidence check": "Comparable post-DD fuel coverage",
-                "Outcome": (
-                    "Pass"
-                    if result.get("coverage_pct", 0) >= 70
-                    else "Calculation floor only"
-                    if result.get("coverage_pct", 0) >= 40
-                    else "Fail - below calculation floor"
-                ),
-                "What it means": _fmt(result.get("coverage_pct"), 1, "%") + " of eligible post-DD fuel; 40% minimum and 70% target",
-            },
-            {
-                "Evidence check": "Complete normal service cycle",
-                "Outcome": "Confirmed" if settings.get("service_cycle_confirmed") else "Not confirmed",
-                "What it means": "Based on the user's operational-record confirmation",
-            },
-            {
-                "Evidence check": "ML specification review",
-                "Outcome": "Selected before post-DD prediction",
-                "What it means": result.get("selected_ml_model") or "Unavailable",
-            },
-            {
-                "Evidence check": "ML comparison with public cubic-speed benchmark",
-                "Outcome": "Benchmark lower MAPE" if validation.get("huber_outperforms_cubic") is False else "Selected Huber lower or equal MAPE",
-                "What it means": "ML superiority not demonstrated" if validation.get("huber_outperforms_cubic") is False else "Benchmark comparison passed",
-            },
-            {
-                "Evidence check": "Fake-date stability screen",
-                "Outcome": "Limited pass" if placebo.get("separated_from_placebos") is True else "Review",
-                "What it means": f"{placebo.get('valid_count', 0)} valid fake-date tests",
-            },
-            {
-                "Evidence check": "Operating-scope representation",
-                "Outcome": "Limited" if dominant_share is not None and dominant_share >= 80 else "Pass",
-                "What it means": result.get("scope_statement", "Unavailable"),
-            },
-            {
-                "Evidence check": "Source references",
-                "Outcome": "Recorded" if documentation_complete else "Incomplete",
-                "What it means": "Dry-dock, route, service-cycle and LCV references",
-            },
-        ]
-    )
-
-
-def show_limits(result):
-    limits = result.get("limitations", [])
-    if limits:
-        st.warning("Limits on interpretation:\n\n- " + "\n- ".join(limits))
-
-
-def explain_report(fuel):
-    rows = fuel["rows"].reset_index(drop=True)
-    selected = st.selectbox("Comparable report", list(range(len(rows))), key="example_report",
-        format_func=lambda i: f"{pd.Timestamp(rows.iloc[i]['Date']):%d %b %Y} | Voyage {rows.iloc[i].get('Voyage', 'Unknown')}")
-    row = rows.iloc[selected]
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Recorded STW", f"{row['STW']:.2f} kn")
-    c2.metric("Recorded displacement", f"{row['DisplacementMT']:,.0f} MT")
-    c3.metric("Propelling time", f"{row['PropellingHours']:.2f} h")
-    st.table(pd.DataFrame({
-        "Fuel basis": ["Expected from pre-DD model", "Reported after DD"],
-        "FOC (VLSFO-eq. MT/day)": [f"{row['ExpectedPreDDCondition_FOC_MT_Day']:.2f}", f"{row['FOC_MT_Day']:.2f}"],
-        "Interval fuel (VLSFO-eq. MT)": [f"{row['ExpectedForIllustrationMT']:.2f}", f"{row['ActualForIllustrationMT']:.2f}"],
-    }).set_index("Fuel basis"))
-    st.write(f"Interval difference: **{row['ExpectedForIllustrationMT'] - row['ActualForIllustrationMT']:+.2f} VLSFO-equivalent MT**.")
-    st.caption("Interval fuel = FOC x propelling hours / 24. Add all comparable interval amounts before calculating the overall percentage; do not average individual report percentages.")
-
-
-def show_results(saved):
-    result, settings = saved["result"], saved["settings"]
-    st.title(f"{settings['vessel']}: Package-level post-dry-dock FOC assessment")
-    st.caption(
-        f"V9.11 | Dock-in: {settings['dock_in']} | Dock-out: {settings['dock_out']} | "
-        f"Post-DD endpoint: {settings['required_post_end']} | "
-        + settings.get("monitoring_basis", "Selected post-DD period")
-    )
-    fuel = fuel_summary(result)
-    if not result.get("valid") or fuel is None:
-        st.error(result.get("reason") or "No valid estimate is available.")
-        show_limits(result)
-        st.info("Open Supporting analysis / Reports used and excluded to review the available reports and exclusion reasons.")
+def heatmap(profile, title: str, x_title: str, chart_key: str):
+    if profile.percent.empty:
+        st.warning(f"No valid rows are available for the {title} profile.")
         return
-    if not np.isclose(fuel["saving_pct"], result["improvement_pct"], atol=1e-7, rtol=0):
-        st.error("The fuel comparison does not reconcile with the primary estimate. No result is displayed.")
-        return
-    if settings.get("is_demo"):
-        st.warning("Synthetic demonstration - this illustrates the workflow and is not evidence from an actual vessel.")
-
-    st.subheader("1. Assessment conclusion")
-    tier, conclusion_text = plain_language_conclusion(result)
-    conclusion_message = f"**{assessment_verdict(result)}**\n\n{conclusion_text}"
-    if tier in {"Supported (prototype screening)", "Indicative"}:
-        st.success(conclusion_message)
-    elif tier in {"Preliminary", "Unstable"}:
-        st.warning(conclusion_message)
-    else:
-        st.error(conclusion_message)
-    st.info("**Recommended action:** " + business_decision(result))
-    with st.expander("How to understand the five possible conclusions"):
-        show_conclusion_guide()
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("ML-estimated package FOC saving", _fmt(result["improvement_pct"], 2, "%"))
-    m2.metric("Post-DD comparison basis", comparison_method_label(result))
-    m3.metric("Eligible post-DD fuel represented", _fmt(result.get("coverage_pct"), 1, "%"))
-    st.caption(
-        "The displayed decimal precision reflects the calculation output and does not represent measurement certainty."
-    )
-
-    st.subheader("2. Reports selected for the comparison")
-    st.markdown("**How comparable post-DD reports were selected**")
-    show_comparison_selection(result, settings)
-    st.markdown("**Reports available, eligible and used**")
-    st.dataframe(assessment_data_table(saved), hide_index=True, width="stretch")
-    st.caption(
-        f"The uploaded workbook contained {saved['filter_report']['input_rows']:,} raw reports. "
-        "Reports failing common filters remain available in the Technical Evidence report audit."
-    )
-    common_reasons = main_filter_reasons(saved)
-    if common_reasons:
-        st.caption("Most common operating-filter exclusions: " + "; ".join(common_reasons) + ".")
-
-    st.subheader("3. How the package-level FOC result was calculated")
-    st.image(
-        figure_png(assessment_story_figure(fuel, result, assessment_verdict(result))),
-        width="stretch",
-    )
-    st.markdown("### Technical basis of this calculation")
-
-    selected_features = result.get("numeric_features", [])
-    if "LogDisplacementRatio" in selected_features:
-        prediction_variables = "Speed through water (STW) and displacement"
-    else:
-        prediction_variables = (
-            "Speed through water (STW) only. Displacement is still "
-            "checked when determining operating comparability."
+    values = profile.percent.values
+    text = [[f"{value:.2f}%" if value > 0 else "" for value in row] for row in values]
+    figure = go.Figure(
+        data=go.Heatmap(
+            z=values,
+            x=profile.percent.columns,
+            y=profile.percent.index,
+            colorscale=[[0, "#ffffff"], [0.25, "#fee2e2"], [1, "#b91c1c"]],
+            colorbar={"title": "% of hours"},
+            hovertemplate=(
+                f"{x_title}: %{{x}}<br>Draft band start: %{{y}} m<br>"
+                "Share of eligible propelling hours: %{z:.3f}%<extra></extra>"
+            ),
+            text=text,
+            texttemplate="%{text}" if values.size <= 300 else None,
         )
-
-    comparison_basis = result.get("comparison_basis")
-    if comparison_basis == "Strict same-route":
-        comparison_description = (
-            "Same-route comparison: post-DD reports are compared with "
-            "pre-DD data from the same route and operating leg."
-        )
-    elif comparison_basis == "Expanded cross-route":
-        comparison_description = (
-            "Expanded cross-route comparison: different routes are used "
-            "because same-route evidence was insufficient. The app retains "
-            "the same operating leg and comparable STW and displacement."
-        )
-    else:
-        comparison_description = "No usable operating comparison was available."
-
-    technical_basis = pd.DataFrame(
-        {
-            "Technical item": [
-                "Baseline model",
-                "Prediction variables",
-                "Model selection",
-                "Operating comparison",
-                "Eligibility filters",
-                "Final calculation",
-            ],
-            "Method used": [
-                (
-                    "Huber regression trained using pre-DD noon reports. "
-                    "Huber regression reduces the influence of abnormal reports "
-                    "without automatically deleting them."
-                ),
-                prediction_variables,
-                (
-                    "Candidate ML models are tested on later pre-DD reports "
-                    "that were not used for training. Post-DD results are not "
-                    "used to select the model."
-                ),
-                comparison_description,
-                (
-                    "At least 18 propelling hours, Beaufort 4 or below, "
-                    "valid interval-aligned fuel and LOG distance, and "
-                    "physically plausible STW."
-                ),
-                (
-                    "Expected and reported fuel are calculated over the same "
-                    "comparable post-DD intervals and weighted by propelling hours."
-                ),
-            ],
-        }
     )
-
-    st.dataframe(
-        technical_basis,
-        hide_index=True,
-        width="stretch",
+    figure.update_layout(
+        title=title,
+        xaxis_title=x_title,
+        yaxis_title="Draft band start [m]",
+        height=max(430, 34 * len(profile.percent.index)),
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
     )
-
-    st.latex(
-        r"FOC\ saving(\%)="
-        r"\frac{Expected\ fuel-Reported\ fuel}"
-        r"{Expected\ fuel}\times100"
-    )
-
-    st.caption(
-        "A positive result means reported post-DD fuel was lower than expected. "
-        "A negative result means reported post-DD fuel was higher than expected."
-    )
-
-    st.subheader("4. Checks affecting how the result can be used")
-    validation = result.get("validation", {})
-    sensitivity_low = result.get("stability_min_pct")
-    sensitivity_high = result.get("stability_max_pct")
-    sensitivity_text = (
-        f"{sensitivity_low:.2f}% to {sensitivity_high:.2f}%"
-        if sensitivity_low is not None and sensitivity_high is not None
-        else "Unavailable"
-    )
-    r1, r2, r3, r4 = st.columns(4)
-    r1.metric(
-        "Sensitivity direction",
-        result.get("stability_status", "Not assessable"),
-        help="Whether the tested alternatives retain the same saving-or-higher-FOC direction; this does not mean the percentage is unchanged.",
-    )
-    r2.metric("Unseen pre-DD prediction error", _fmt(validation.get("huber", {}).get("mape_pct"), 2, "%"), help="Average percentage error when predicting later pre-dry-dock reports not used for fitting.")
-    r3.metric(
-        "Sensitivity range",
-        sensitivity_text,
-        help="Range across model, route, anomaly and individual-report rechecks; not a confidence interval.",
-    )
-    r4.metric("Gross FOC reports flagged", f"{result.get('flagged_foc_rows', 0)}")
-    st.write("**Operating scope:** " + result.get("scope_statement", "Comparable post-DD reports only."))
-    st.caption("The estimate is package-level. It does not prove causation or assign saving to individual dry-dock work items.")
-
-    with st.expander("Limits behind this conclusion"):
-        show_limits(result)
-        st.caption("The complete decision checklist is available under Supporting analysis / Evidence checks and model reliability.")
-    with st.expander("How individual reports contribute to the overall estimate"):
-        explain_report(fuel)
-        st.code(f"Overall: ({fuel['expected']:,.2f} - {fuel['actual']:,.2f}) / {fuel['expected']:,.2f} x 100 = {fuel['saving_pct']:.2f}%", language=None)
-        st.caption("Displayed totals are rounded. The calculation uses full precision.")
-    st.download_button("Download printable assessment summary (HTML)", data=printable_report(saved),
-                       file_name="mipd_foc_summary_v9_11.html", mime="text/html")
-    st.caption("Open the downloaded summary in a browser and choose Print / Save as PDF.")
+    figure.update_yaxes(autorange="reversed")
+    st.plotly_chart(figure, use_container_width=True, key=chart_key)
 
 
-def show_checks(saved):
-    result = saved["result"]
-    st.subheader("Evidence checks behind the conclusion")
-    st.write("These project-defined checks determine whether the calculated percentage is supported, limited or not interpretable. They are not certification requirements.")
-    st.dataframe(evidence_checklist(saved), hide_index=True, width="stretch")
-    st.subheader("ML model selected from pre-DD data")
-    st.write(result.get("model_selection_reason") or "No model-selection explanation is available.")
-    comparison = result.get("ml_candidate_comparison", pd.DataFrame())
-    if isinstance(comparison, pd.DataFrame) and not comparison.empty:
-        st.dataframe(comparison.round(2), hide_index=True, width="stretch")
-    sensitivity = result.get("model_sensitivity", pd.DataFrame())
-    if isinstance(sensitivity, pd.DataFrame) and not sensitivity.empty:
-        st.dataframe(sensitivity.round(2), hide_index=True, width="stretch")
-        st.caption("These are alternative method results, not additive savings or a statistical confidence interval.")
-    st.subheader("Direction check across alternative analyses")
-    st.metric("Sensitivity direction", result.get("stability_status", "Not assessable"))
-    st.write(result.get("stability_summary", "No stability explanation is available."))
-    if result.get("stability_min_pct") is not None and result.get("stability_max_pct") is not None:
-        st.caption(
-            f"Available sensitivity range: {result['stability_min_pct']:.2f}% to "
-            f"{result['stability_max_pct']:.2f}%. This range is not a statistical confidence interval."
-        )
-    anomalies = result.get("foc_anomalies", pd.DataFrame())
-    if isinstance(anomalies, pd.DataFrame) and not anomalies.empty:
-        st.warning(
-            "Gross FOC reports were flagged for review. They remain in the source audit and were not "
-            "silently deleted from the primary calculation."
-        )
-        st.dataframe(anomalies.round(3), hide_index=True, width="stretch")
-    st.subheader("Prediction check on unseen pre-DD reports")
-    st.write("Earlier pre-DD reports train each model and later pre-DD reports test it. This checks performance on observations that were not used to fit the model.")
-    validation = result["validation"]
-    left, right = st.columns(2)
-    left.metric("Selected Huber MAPE", _fmt(validation["huber"].get("mape_pct"), 2, "%"))
-    right.metric("Cubic-speed benchmark MAPE", _fmt(validation["cubic"].get("mape_pct"), 2, "%"))
-    st.caption("Lower MAPE indicates lower average percentage prediction error. MAPE is not an uncertainty interval around the saving estimate.")
-    better = validation.get("huber_outperforms_cubic")
-    if better is False:
-        difference = validation["huber"].get("mape_pct") - validation["cubic"].get("mape_pct")
-        st.warning(f"ML superiority was not demonstrated. The selected Huber MAPE was {difference:.2f} percentage points higher than the public cubic-speed benchmark on these unseen reports.")
-    elif better is True:
-        st.info("The selected Huber model had lower or equal MAPE on these unseen reports. This does not guarantee better performance for another vessel or operating period.")
-    else:
-        st.warning("There were insufficient valid test results to compare prediction errors.")
-    with st.expander("Validation metrics and report-level predictions"):
-        st.dataframe(_validation_table(validation).round(2), hide_index=True, width="stretch")
-        st.dataframe(validation["predictions"], hide_index=True, width="stretch", height=260)
-    st.subheader("False-effect check using pre-DD dates")
-    placebo = result.get("placebo", {})
-    count = placebo.get("valid_count", 0)
-    if not count:
-        st.info(placebo.get("reason") or "No valid fake dry-dock tests were available.")
-    elif placebo.get("separated_from_placebos") is True:
-        st.info(f"The actual estimate exceeded all {count} valid fake-date effects. This is limited stability evidence, not proof of causation.")
-    else:
-        st.warning(f"Across {count} valid fake-date tests, at least one effect was as large as the actual estimate.")
-    st.caption("The app applies fake intervention dates within the pre-DD period. Large apparent savings at those dates would indicate that the method can detect changes even without the real dry dock. Few valid tests limit the conclusion.")
-    with st.expander("Fake-date results and exploratory statistic"):
-        st.metric("Exploratory one-sided p-value", _fmt(placebo.get("empirical_p_one_sided"), 3))
-        st.caption("This statistic is not the probability that the saving is real. No 100% confidence claim is made.")
-        st.dataframe(placebo.get("results", pd.DataFrame()), hide_index=True, width="stretch")
-    with st.expander("Primary ML estimate and public cubic-speed benchmark"):
-        st.table(pd.DataFrame({"Method": [str(result.get("selected_ml_model") or "Huber ML") + " - primary", "Public cubic-speed benchmark (V^3)"],
-            "Estimated saving (%)": [_fmt(result.get("improvement_pct"), 2), _fmt(result.get("cubic_benchmark_saving_pct"), 2)]}).set_index("Method"))
-        st.caption("Both methods use the same comparable post-DD reports. The cubic-speed rule is a simple public physics benchmark, not an ISO-prescribed FOC-saving method or a replacement for the primary ML method. The estimates are not additive.")
+def dataframe_csv(frame: pd.DataFrame, include_index: bool = False) -> bytes:
+    return frame.to_csv(index=include_index).encode("utf-8")
 
 
-def show_operating_evidence(saved):
-    result = saved["result"]
-    assessed = result.get("assessed_rows", pd.DataFrame())
-    st.subheader("Reported post-DD FOC compared with model-expected FOC")
-    figure = _actual_expected_scatter(assessed)
-    if figure is None:
-        st.info("No assessed post-DD reports are available for this comparison.")
-    else:
-        st.plotly_chart(figure, width="stretch")
-        st.caption("The dashed diagonal represents reported FOC equal to model-expected FOC. Comparable reports below the line used less fuel than expected; reports above the line used more.")
-        comparison_comment = actual_expected_comment(result)
-        st.markdown("**What this chart shows for the selected vessel**")
-        st.write(comparison_comment["summary"])
-        if comparison_comment["warnings"]:
-            st.warning("Important context:\n\n- " + "\n- ".join(comparison_comment["warnings"]))
+def _profile_percent_text(value) -> str:
+    if pd.isna(value):
+        return ""
+    return "-" if abs(float(value)) < 0.0005 else f"{float(value):.3f}%"
 
-    st.subheader("Same-route and cross-route comparison options")
-    st.table(pd.DataFrame({
-        "Comparison": ["Same-route comparison (preferred)", "Cross-route comparison (fallback)"],
-        "Comparable reports": [
-            result.get("strict_supported_after_rows", 0),
-            result.get("expanded_supported_after_rows", 0),
-        ],
-        "Comparable fuel coverage": [
-            _fmt(result.get("strict_coverage_pct"), 1, "%"),
-            _fmt(result.get("expanded_coverage_pct"), 1, "%"),
-        ],
-        "Estimated effect": [
-            _fmt(result.get("strict_saving_pct"), 2, "%"),
-            _fmt(result.get("expanded_saving_pct"), 2, "%"),
-        ],
-        "Role": [
-            "Preferred" if result.get("comparison_basis") == "Strict same-route" else "Insufficient for headline",
-            "Selected fallback" if result.get("comparison_basis") == "Expanded cross-route" else "Not required",
-        ],
-    }).set_index("Comparison"))
 
-    st.caption("Automatic interpretations are recalculated from the current assessment. They describe the displayed evidence and do not establish causation.")
+def styled_profile_table(frame: pd.DataFrame):
+    """Apply compact, dependency-free colouring while keeping values numeric."""
+    table = frame.copy()
+    table.index.name = "Draft band start [m]"
+    body_rows = [index for index in table.index if index != "Total"]
+    body_columns = [column for column in table.columns if column != "Total"]
+    body_max = float(table.loc[body_rows, body_columns].max().max()) if body_rows else 0.0
 
-    with st.expander("Technical diagnostic: were post-DD speed and loading represented before dry docking?", expanded=False):
-        st.plotly_chart(_support_scatter(saved["eligible"], assessed), width="stretch")
-        st.caption(
-            "Blue points are relevant pre-DD training reports. Green points are comparable post-DD reports used. "
-            "Amber points are post-DD reports outside learned support. This diagnostic shows the report-level "
-            "STW and displacement classification; it is not a trend graph and does not calculate the saving."
-        )
-        support_comment = operating_support_comment(saved["eligible"], result)
-        st.write(support_comment["summary"])
-        profile = result.get("pre_dd_speed_profile", {})
-        if profile:
-            st.caption(
-                f"Valid pre-DD STW observed: {profile['minimum']:.1f}-{profile['maximum']:.1f} kn; "
-                f"central 90%: {profile['p05']:.1f}-{profile['p95']:.1f} kn. These values describe "
-                "the available data and are not a fixed speed filter."
+    def cell_colours(series: pd.Series) -> list[str]:
+        styles: list[str] = []
+        for value in series:
+            number = float(value) if pd.notna(value) else 0.0
+            if number <= 0 or body_max <= 0:
+                styles.append("background-color:#f8fafc;color:#94a3b8;text-align:center")
+                continue
+            strength = min(number / body_max, 1.0)
+            red = int(254 - 69 * strength)
+            green = int(242 - 214 * strength)
+            blue = int(242 - 214 * strength)
+            text_colour = "#ffffff" if strength >= 0.58 else "#7f1d1d"
+            styles.append(
+                f"background-color:rgb({red},{green},{blue});color:{text_colour};"
+                "font-weight:600;text-align:center"
             )
+        return styles
 
-    with st.expander("Report-level expected and reported FOC"):
-        st.dataframe(report_comparison(assessed).round(2), hide_index=True, width="stretch")
+    styler = table.style.format(_profile_percent_text)
+    if body_rows and body_columns:
+        styler = styler.apply(
+            cell_colours,
+            axis=0,
+            subset=pd.IndexSlice[body_rows, body_columns],
+        )
+    if "Total" in table.columns:
+        styler = styler.set_properties(
+            subset=pd.IndexSlice[:, ["Total"]],
+            **{"background-color": "#e2e8f0", "font-weight": "700", "color": "#0f172a"},
+        )
+    if "Total" in table.index:
+        styler = styler.set_properties(
+            subset=pd.IndexSlice[["Total"], :],
+            **{"background-color": "#334155", "font-weight": "700", "color": "#ffffff"},
+        )
+    return styler
 
 
-def show_reports(saved):
-    result, settings = saved["result"], saved["settings"]
-    counts = selection_counts(saved["period_data"], saved["eligible"], result)
-    st.subheader("Noon-report inclusion and exclusion log")
-    st.table(pd.DataFrame({"Stage": ["Within selected dates", "Excluded by operating filters", "Passed operating filters"],
-        "Pre-DD": [counts["pre_raw"], counts["pre_raw"] - counts["pre_eligible"], counts["pre_eligible"]],
-        "Post-DD": [counts["post_raw"], counts["post_raw"] - counts["post_eligible"], counts["post_eligible"]]}).set_index("Stage"))
-    st.write(f"Post-DD support assessment: **{counts['supported']} used**, **{counts['outside']} outside pre-DD support**, **{counts['unassessed']} not assessed**.")
-    st.caption(f"Raw workbook: {saved['filter_report']['input_rows']} reports. Pre-DD and post-DD counts are separate groups. Passing operating filters is not the same as passing the operating-support test.")
-    ledger = build_report_ledger(saved["period_data"], saved["eligible"], result, settings)
-    status = st.selectbox("Report category to display", ["All"] + sorted(ledger["Assessment use"].unique().tolist()))
-    display = ledger if status == "All" else ledger.loc[ledger["Assessment use"].eq(status)]
-    cols = [
-        "ReportID", "Date", "Assessment use", "Reason", "FOC anomaly flag",
-        "FOC anomaly review", "Period", "Voyage", "AnalysisRoute", "ServiceLeg",
-        "STW", "DisplacementMT", "FOC_MT_Day", "PropellingHours", "Beaufort",
-    ]
-    display_table = display[[c for c in cols if c in display]].rename(
-        columns={
-            "ReportID": "Report ID",
-            "AnalysisRoute": "Assessment route",
-            "ServiceLeg": "Operating leg",
-            "DisplacementMT": "Displacement (MT)",
-            "FOC_MT_Day": "FOC (VLSFO-eq. MT/day)",
-            "PropellingHours": "Propelling hours",
+def render_readable_profile_table(profile):
+    """Show the complete operating matrix without duplicate band views."""
+    table = profile_with_totals(profile.percent)
+    table.index.name = "Draft band start [m]"
+    st.caption(
+        "Complete matrix in one view; scroll horizontally for later bands. "
+        "Zero cells are shown as -. Darker red means a larger share of total propelling hours."
+    )
+    st.dataframe(
+        styled_profile_table(table),
+        use_container_width=True,
+        height=460,
+    )
+    return table
+
+
+def excel_monthly_display(monthly: pd.DataFrame) -> pd.DataFrame:
+    """Create the Profile-sheet table that supplies all three line graphs."""
+    return pd.DataFrame(
+        {
+            "YEAR": monthly["month"].dt.year,
+            "MONTH": monthly["month"].dt.month,
+            "Period Start": monthly["data_start"].dt.strftime("%d/%m/%Y"),
+            "Period End": monthly["data_end"].dt.strftime("%d/%m/%Y"),
+            "Elapsed Time [h]": monthly["available_hours"],
+            "Reported Propelling Hours [h]": monthly["propelling_hours"],
+            "Propelling Share of Elapsed Time [%]": monthly["working_ratio_pct"],
+            "Mean Reported Seawater Temperature [deg C]": monthly["avg_sea_temp_excel"],
+            "Mean Reported Interval STW [kn]": monthly["avg_speed_knots"],
         }
     )
-    st.dataframe(display_table, hide_index=True, width="stretch", height=360)
-    st.caption("Report ID is the parsed report sequence, not an Excel row number. A report may fail multiple rules; reasons are listed together and it is counted once. No raw rows are deleted.")
-    st.download_button("Download complete report audit (CSV)", data=ledger.to_csv(index=False).encode("utf-8-sig"),
-                       file_name="mipd_report_audit_v9_11.csv", mime="text/csv")
-    with st.expander("Expected and reported FOC for assessed post-DD reports"):
-        st.caption("Fuel is VLSFO-equivalent. Unsupported rows are marked No and do not contribute to the estimate.")
-        st.dataframe(report_comparison(result.get("assessed_rows", pd.DataFrame())).round(2), hide_index=True, width="stretch")
 
 
-def show_method(saved):
-    result, settings = saved["result"], saved["settings"]
-    st.subheader("Calculation method, assumptions and downloads")
-    st.markdown("**Methods applied in this assessment**")
-    st.dataframe(methods_used_table(result), hide_index=True, width="stretch")
-    st.markdown("**Calculation equations**")
-    st.latex(r"FOC_{eq,24h}=\frac{\sum_f m_f LCV_f}{40.5}\frac{24}{H_p}")
-    if "LogDisplacementRatio" in result.get("numeric_features", []):
-        st.latex(r"\ln(FOC)=\beta_0+\beta_v\ln(STW)+\beta_\Delta\ln(\Delta/\Delta_{ref})")
-    else:
-        st.latex(r"\ln(FOC)=\beta_0+\beta_v\ln(STW)")
-    st.latex(r"Saving(\%)=100\left(1-\frac{\sum_i FOC_{actual,i}H_i/24}{\sum_i\widehat{FOC}_iH_i/24}\right)")
-    st.write("Both Huber specifications learn only from pre-DD reports. The app selects between STW-only and STW-and-displacement Huber using pre-DD chronological validation and coefficient review. Displacement always remains in the operating-support test. Beaufort <=4 and at least 18 propelling hours are fixed eligibility rules. The app first tests the same route and operating leg, then uses an expanded same-leg cross-route comparison only when strict evidence is insufficient. A training-only smearing factor returns log predictions to MT/day.")
-    st.write(
-        "For transparency, the selected Huber model is compared with the public cubic-speed rule of "
-        "thumb, FOC = a x STW^3. The vessel-specific coefficient a is fitted using pre-DD reports only. "
-        "This benchmark is not a confidential company method and is not an ISO-prescribed saving calculation."
+def show_excel_monthly_table(monthly: pd.DataFrame) -> pd.DataFrame:
+    table = excel_monthly_display(monthly)
+    st.dataframe(
+        table.style.format(
+            {
+                "Elapsed Time [h]": "{:.1f}",
+                "Reported Propelling Hours [h]": "{:.1f}",
+                "Propelling Share of Elapsed Time [%]": "{:.0f}%",
+                "Mean Reported Seawater Temperature [deg C]": "{:.6f}",
+                "Mean Reported Interval STW [kn]": "{:.5f}",
+            },
+            na_rep="Needs review",
+        ),
+        hide_index=True,
+        use_container_width=True,
     )
-    st.info(result.get("model_selection_reason") or "No model-selection explanation is available.")
-    details = result.get("model_details", {})
-    if details:
-        equation = f"ln(FOC) = {details['transformed_intercept']:.4f} {details['speed_coefficient']:+.4f} ln(STW)"
-        if details.get("displacement_coefficient") is not None:
-            equation += f" {details['displacement_coefficient']:+.4f} ln(displacement / {details['displacement_reference_mt']:.0f})"
-        equation += f"\nPredicted FOC = {details['smearing_factor']:.4f} x exp(predicted ln(FOC))"
-        st.code(equation, language=None)
-        st.dataframe(result["coefficients"], hide_index=True, width="stretch")
-    st.caption("Huber settings: epsilon 1.35 and alpha 0.0001. A result is Inconclusive when MAPE exceeds 12%, absolute bias exceeds 8%, validation is unavailable, or the learned speed exponent falls outside 1.5-4.5. Indicative requires at least 20 comparable post-DD reports and 70% fuel coverage; 30 reports are preferred for Supported prototype screening. The fixed 13-25 kn filter is not used. These are declared project rules, not IMO, ISO or class requirements.")
-    with st.expander("Method scope and standards reference", expanded=False):
-        st.write(
-            "This prototype applies the same-vessel and comparable-operating-condition principles commonly "
-            "used in vessel performance assessment. It does not claim ISO 19030 conformity. The prototype "
-            "uses noon-report data, vessel-specific Huber regression and a project-defined speed/loading "
-            "comparability test rather than an ISO 19030 verification calculation. Results are intended for "
-            "internal engineering screening. Its adjusted-baseline concept is consistent with general "
-            "measurement-and-verification principles, but ISO 50015 conformity is not claimed."
+    return table
+
+
+def plot_excel_monthly_graphs(table: pd.DataFrame, key_prefix: str):
+    """Plot the three final table columns directly, without recalculation."""
+    chart_data = table.copy()
+    chart_data["Period"] = chart_data.apply(
+        lambda row: f"{int(row['YEAR'])}/{int(row['MONTH'])}", axis=1
+    )
+    chart_specs = [
+        (
+            "Propelling Share of Elapsed Time [%]",
+            "Monthly Propelling Share of Elapsed Time",
+            "Propelling share [%]",
+        ),
+        (
+            "Mean Reported Seawater Temperature [deg C]",
+            "Monthly Mean Reported Seawater Temperature",
+            "Mean reported temperature [deg C]",
+        ),
+        (
+            "Mean Reported Interval STW [kn]",
+            "Monthly Mean Reported Interval STW",
+            "Mean reported STW [kn]",
+        ),
+    ]
+    for column, title, y_title in chart_specs:
+        figure = px.line(
+            chart_data,
+            x="Period",
+            y=column,
+            markers=False,
+            title=title,
         )
-        st.table(
-            pd.DataFrame(
-                {
-                    "Standards-related principle": [
-                        "Same-vessel comparison",
-                        "Comparable operating conditions",
-                        "Weather restriction",
-                        "Continuous sensor data",
-                        "ISO reference-displacement correction",
-                        "ISO 19030 performance indicator",
-                        "ISO 19030 conformity claimed",
-                        "ISO 50015 conformity claimed",
-                        "Public speed benchmark",
-                    ],
-                    "Prototype treatment": [
-                        "Applied",
-                        "Applied using vessel-specific STW/displacement support",
-                        "Beaufort 4 or below",
-                        "Not available; noon reports are used",
-                        "Not implemented",
-                        "Not implemented",
-                        "No",
-                        "No",
-                        "Cubic-speed rule of thumb, FOC = a x STW^3",
-                    ],
-                }
-            ).set_index("Standards-related principle")
+        figure.update_layout(
+            height=260,
+            xaxis_title=None,
+            yaxis_title=y_title,
+            margin={"l": 20, "r": 20, "t": 50, "b": 20},
+        )
+        st.plotly_chart(
+            figure,
+            use_container_width=True,
+            key=f"{key_prefix}-{column}-table-chart",
+        )
+
+
+def excel_data_sum_display(data_sum: pd.DataFrame, imo_number: str) -> pd.DataFrame:
+    """Expose the internal Data_sum in the same column order as the workbook."""
+    return pd.DataFrame(
+        {
+            "IMO Number": imo_number,
+            "Vessel": data_sum["vessel"],
+            "Time(Noon/SOP/EOP)": data_sum["timestamp"],
+            "Duration [h]": data_sum["duration_hours"],
+            "Reported Speed [kn]": data_sum["speed_knots"],
+            "Active Midship Draft [m]": data_sum["draft_m"],
+            "Reported Sea-Water Temperature [deg C]": data_sum["data_sum_sea_temp"],
+            "YEAR": data_sum["year"],
+            "MONTH": data_sum["month"],
+            "DAY": data_sum["day"],
+            "HOUR": data_sum["hour"],
+            "MINUTE": data_sum["minute"],
+            "Reported Duration [days]": data_sum["duration_days"],
+            "M/E Output [kW]": data_sum["me_output_kw"],
+            "Source": data_sum["source"],
+        }
+    )
+
+
+def render_excel_profile_details(
+    profile,
+    profile_name: str,
+    vessel_name: str,
+    imo_number: str,
+    overall: dict,
+):
+    st.divider()
+    st.subheader(f"{profile_name} summary")
+    vessel_summary = pd.DataFrame(
+        [
+            {
+                "Vessel Name": vessel_name,
+                "IMO No.": imo_number or "Not provided",
+                "TTL Duration [day]": overall["propelling_hours"] / 24,
+                "Profile TTL [day]": profile.total_hours / 24,
+            }
+        ]
+    )
+    st.dataframe(
+        vessel_summary.style.format(
+            {"TTL Duration [day]": "{:.7f}", "Profile TTL [day]": "{:.7f}"}
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+    is_power_profile = "M/E Output" in profile_name
+    if is_power_profile:
+        st.metric(
+            "Maximum Reported Noon M/E Output",
+            f"{overall['max_noon_me_output_kw']:,.0f} kW",
         )
         st.caption(
-            "Public references: ISO 19030-2 overview (iso.org/standard/63775.html); "
-            "ISO 50015 overview (iso.org/standard/60043.html); IMO GreenVoyage2050 speed management "
-            "(greenvoyage2050.imo.org/technology/speed-management/)."
+            "Maximum power is taken only from the uploaded Noon report's M/E output column."
         )
-    with st.expander("Saved inputs, source references and operating mappings"):
-        st.json({key: str(value) for key, value in settings.items()})
-        st.dataframe(saved["lcv_table"], hide_index=True, width="stretch")
-        st.dataframe(saved["route_table"], hide_index=True, width="stretch")
-        st.dataframe(saved["service_leg_table"], hide_index=True, width="stretch")
-    export = _excel_export(result, settings, saved["eligible"], saved["lcv_table"], saved["route_table"], saved["service_leg_table"])
-    st.download_button("Download assessment workbook", data=export,
-        file_name="mipd_foc_assessment_v9_11.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.download_button("Download saved assessment inputs (JSON)", data=json.dumps(settings, default=str, indent=2),
-        file_name="mipd_foc_inputs_v9_11.json", mime="application/json")
-    st.download_button("Download full calculation methodology", data=Path(__file__).with_name("METHODOLOGY.md").read_text(encoding="utf-8"),
-        file_name="MIPD_FOC_Methodology.md", mime="text/markdown")
-
-
-if st.session_state.get("pending_page"):
-    st.session_state["page"] = st.session_state.pop("pending_page")
-if "page" not in st.session_state:
-    st.session_state["page"] = "Result summary" if "mipd_v9_11" in st.session_state else "Setup"
-st.sidebar.title("Package-level FOC assessment")
-st.sidebar.caption("V9.11 | Last completed assessment is preserved")
-page = st.sidebar.radio("View", ["Result summary", "Supporting analysis", "Setup"], key="page")
-if page == "Setup":
-    render_setup()
-else:
-    saved = st.session_state.get("mipd_v9_11")
-    if saved is None:
-        st.info("Open Setup to upload a workbook and run the assessment.")
-        st.stop()
-    if saved.get("setup_signature") != st.session_state.get("draft_signature"):
-        st.warning("Setup has unrun changes. This is the last completed assessment, using its saved settings.")
-    if page == "Result summary":
-        show_results(saved)
     else:
-        st.title("Supporting analysis and report audit")
-        st.caption(f"{saved['settings']['vessel']} | Post-DD endpoint: {saved['settings']['required_post_end']}")
-        topic = st.selectbox(
-            "Supporting analysis section",
-            ["Evidence checks and model reliability", "Comparable operating conditions", "Reports used and excluded", "Method and downloads"],
-            key="technical_topic",
+        st.metric(
+            "Maximum Reported Noon Speed",
+            f"{overall['max_noon_speed_knots']:,.2f} kn",
         )
-        {
-            "Evidence checks and model reliability": lambda: show_checks(saved),
-            "Comparable operating conditions": lambda: show_operating_evidence(saved),
-            "Reports used and excluded": lambda: show_reports(saved),
-            "Method and downloads": lambda: show_method(saved),
-        }[topic]()
+        st.caption(
+            "Maximum speed is taken only from the uploaded Noon report's average-speed column."
+        )
+
+    overall_row = {
+        "Start Year": overall["year"],
+        "Period Start": overall["data_start"].strftime("%d/%m/%Y"),
+        "Period End": overall["data_end"].strftime("%d/%m/%Y"),
+        "TTL [h]": overall["total_hours"],
+        "Reported Propelling Hours [h]": overall["propelling_hours"],
+        "Reported Propelling Ratio [%]": overall["working_ratio_pct"],
+        "Mean Reported Sea-Water Temperature [deg C]": overall["avg_sea_temp_excel"],
+        "Mean Reported Speed [kn]": overall["avg_speed_knots"],
+    }
+    if is_power_profile:
+        overall_row["Maximum Reported Noon M/E Output [kW]"] = overall["max_noon_me_output_kw"]
+    else:
+        overall_row["Maximum Reported Noon Speed [kn]"] = overall["max_noon_speed_knots"]
+    overall_table = pd.DataFrame([overall_row])
+    overall_formats = {
+        "TTL [h]": "{:.0f}",
+        "Reported Propelling Hours [h]": "{:.1f}",
+        "Reported Propelling Ratio [%]": "{:.2f}%",
+        "Mean Reported Sea-Water Temperature [deg C]": "{:.6f}",
+        "Mean Reported Speed [kn]": "{:.5f}",
+    }
+    if is_power_profile:
+        overall_formats["Maximum Reported Noon M/E Output [kW]"] = "{:,.0f}"
+    else:
+        overall_formats["Maximum Reported Noon Speed [kn]"] = "{:.2f}"
+    st.dataframe(
+        overall_table.style.format(overall_formats),
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption(
+        "The mean sea-water temperature is calculated from the internally created Data_sum "
+        "'Sea Water Temp.' column. "
+        "The source is located from the uploaded two-row title 'Sea Water temperature at noon', "
+        "regardless of its Excel column position."
+    )
+
+
+def render_fuel_summary(fuel: dict, foc_saving_percent: float, fuel_price: float):
+    """Render M/E fuel consumption and the assumed FOC saving."""
+    st.subheader("M/E Fuel Consumption and Assumed FOC Saving")
+    grades = list(fuel["total_by_grade"])
+    fuel_rows = []
+    for report_name, grade_values, equivalent in (
+        ("Noon", fuel["noon_by_grade"], fuel["noon_vlsfo_equivalent_mt"]),
+        ("Arrival", fuel["arrival_by_grade"], fuel["arrival_vlsfo_equivalent_mt"]),
+    ):
+        row = {"Report": report_name}
+        row.update({f"{grade} [MT]": grade_values[grade] for grade in grades})
+        row["Raw total [MT]"] = sum(grade_values.values())
+        row["VLSFO-equivalent [MT]"] = equivalent
+        fuel_rows.append(row)
+    fuel_table = pd.DataFrame(fuel_rows)
+    fuel_formats = {
+        column: "{:,.3f}" for column in fuel_table.columns if column != "Report"
+    }
+    st.dataframe(
+        fuel_table.style.format(fuel_formats),
+        hide_index=True,
+        use_container_width=True,
+    )
+    with st.expander("Show fuel-grade conversion to VLSFO equivalent"):
+        conversion_table = pd.DataFrame(
+            [
+                {
+                    "Fuel grade": grade,
+                    "Actual total [MT]": fuel["total_by_grade"][grade],
+                    "LCV [MJ/kg]": fuel["lcv_mj_per_kg"][grade],
+                    "Conversion factor": fuel["conversion_factor"][grade],
+                    "VLSFO-equivalent [MT]": fuel["equivalent_by_grade"][grade],
+                }
+                for grade in grades
+            ]
+        )
+        st.dataframe(
+            conversion_table.style.format(
+                {
+                    "Actual total [MT]": "{:,.3f}",
+                    "LCV [MJ/kg]": "{:.1f}",
+                    "Conversion factor": "{:.6f}",
+                    "VLSFO-equivalent [MT]": "{:,.3f}",
+                }
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.code("VLSFO-equivalent MT = actual MT x fuel LCV / 40.5")
+
+    equivalent_consumption = fuel["total_vlsfo_equivalent_mt"]
+    saving_rate = foc_saving_percent / 100
+    foc_saving_table = pd.DataFrame(
+        [
+            {
+                "Item": "Total M/E fuel",
+                "Common basis": "VLSFO equivalent",
+                "Reported Consumption [MT]": fuel["total_raw_mt"],
+                "VLSFO-Equivalent Consumption [MT]": equivalent_consumption,
+                "FOC Saving Assumption [%]": foc_saving_percent,
+                "FOC saving [VLSFO-eq. MT]": equivalent_consumption * saving_rate,
+                "VLSFO price [US$/MT]": fuel_price,
+                "Total Estimated Cost for Uploaded Period [US$]": equivalent_consumption * saving_rate * fuel_price,
+            },
+        ]
+    )
+    st.dataframe(
+        foc_saving_table.style.format(
+            {
+                "Reported Consumption [MT]": "{:,.3f}",
+                "VLSFO-Equivalent Consumption [MT]": "{:,.3f}",
+                "FOC Saving Assumption [%]": "{:.1f}%",
+                "FOC saving [VLSFO-eq. MT]": "{:,.3f}",
+                "VLSFO price [US$/MT]": "{:,.2f}",
+                "Total Estimated Cost for Uploaded Period [US$]": "{:,.2f}",
+            }
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption(
+        "Includes M/E steaming consumption from Noon and Arrival reports. "
+        "D/G, boiler, cylinder oil and stopping-condition fuel remain excluded, matching the Profile scope."
+    )
+
+
+def build_payback_analysis(
+    capex_usd: float,
+    annual_gross_fuel_saving_usd: float,
+    annual_additional_opex_usd: float,
+    annual_avoided_co2_cost_usd: float,
+    charter_duration_years: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build payback and cumulative cash-flow tables over the charter period."""
+    scenarios: list[tuple[str, int | None]] = [
+        ("Fuel-saving only (no avoided levy benefit)", None)
+    ]
+    if annual_avoided_co2_cost_usd > 0:
+        scenarios.extend(
+            [
+                ("Avoided CO2 levy benefit after 1-year delay", 2),
+                ("Avoided CO2 levy benefit after 2-year delay", 3),
+            ]
+        )
+
+    cashflow_rows: list[dict] = []
+    summary_rows: list[dict] = []
+
+    for scenario_name, levy_start_year in scenarios:
+        cumulative = -capex_usd
+        cashflow_rows.append(
+            {
+                "Scenario": scenario_name,
+                "Year": 0,
+                "Gross fuel saving [US$]": 0.0,
+                "Avoided CO2 levy benefit [US$]": 0.0,
+                "Additional OPEX [US$]": 0.0,
+                "Net cash flow [US$]": 0.0,
+                "Cumulative cash flow [US$]": cumulative,
+            }
+        )
+
+        payback_years: float | None = None
+        charter_net_benefit = 0.0
+
+        # Use a long horizon so payback can still be reported when it occurs
+        # after the selected charter period.
+        calculation_horizon = max(charter_duration_years, 200)
+        for year in range(1, calculation_horizon + 1):
+            avoided_co2 = (
+                annual_avoided_co2_cost_usd
+                if levy_start_year is not None and year >= levy_start_year
+                else 0.0
+            )
+            net_cash_flow = (
+                annual_gross_fuel_saving_usd
+                + avoided_co2
+                - annual_additional_opex_usd
+            )
+            previous_cumulative = cumulative
+            cumulative += net_cash_flow
+
+            if (
+                payback_years is None
+                and net_cash_flow > 0
+                and previous_cumulative < 0 <= cumulative
+            ):
+                payback_years = (year - 1) + (-previous_cumulative / net_cash_flow)
+
+            if year <= charter_duration_years:
+                charter_net_benefit += net_cash_flow
+                cashflow_rows.append(
+                    {
+                        "Scenario": scenario_name,
+                        "Year": year,
+                        "Gross fuel saving [US$]": annual_gross_fuel_saving_usd,
+                        "Avoided CO2 levy benefit [US$]": avoided_co2,
+                        "Additional OPEX [US$]": annual_additional_opex_usd,
+                        "Net cash flow [US$]": net_cash_flow,
+                        "Cumulative cash flow [US$]": cumulative,
+                    }
+                )
+
+        year_one_net_saving = annual_gross_fuel_saving_usd - annual_additional_opex_usd
+        charter_end_cash_flow = charter_net_benefit - capex_usd
+        payback_within_charter = (
+            payback_years is not None and payback_years <= charter_duration_years
+        )
+        summary_rows.append(
+            {
+                "Scenario": scenario_name,
+                "First-year net benefit [US$]": year_one_net_saving,
+                "Payback period [years]": payback_years,
+                "Payback within charter": "Yes" if payback_within_charter else "No",
+                "Net surplus at charter end [US$]": max(charter_end_cash_flow, 0.0),
+                "Unrecovered CAPEX at charter end [US$]": max(-charter_end_cash_flow, 0.0),
+            }
+        )
+
+    return pd.DataFrame(cashflow_rows), pd.DataFrame(summary_rows)
+
+
+def render_payback_analysis(
+    overall: dict,
+    fuel: dict,
+    foc_saving_percent: float,
+    fuel_price: float,
+):
+    """Render the payback tab from the existing Profile fuel result."""
+    st.subheader("Fuel-Saving Payback and Charter Outcome")
+    st.caption(
+        "The app annualises the assumed FOC saving calculated over the uploaded report period. "
+        "CAPEX and other commercial assumptions must be entered manually."
+    )
+
+    analysis_hours = float(overall.get("total_hours", float("nan")))
+    equivalent_consumption_mt = float(fuel.get("total_vlsfo_equivalent_mt", 0.0))
+
+    if not math.isfinite(analysis_hours) or analysis_hours <= 0:
+        st.error("Payback cannot be calculated because the analysis duration is invalid.")
+        return
+    if not 0 <= foc_saving_percent <= 100:
+        st.error("FOC saving assumption must be between 0% and 100%.")
+        return
+    if fuel_price < 0:
+        st.error("Fuel price cannot be negative.")
+        return
+
+    analysis_days = analysis_hours / 24
+    period_fuel_saving_mt = equivalent_consumption_mt * foc_saving_percent / 100
+    annualisation_factor = (365 * 24) / analysis_hours
+    calculated_annual_fuel_saving_mt = period_fuel_saving_mt * annualisation_factor
+
+    basis_columns = st.columns(3)
+    basis_columns[0].metric("Uploaded report span", f"{analysis_days:,.1f} days")
+    basis_columns[1].metric("Period fuel saving", f"{period_fuel_saving_mt:,.3f} MT")
+    basis_columns[2].metric(
+        "Annualised assumed fuel saving",
+        f"{calculated_annual_fuel_saving_mt:,.3f} MT/year",
+    )
+
+    if analysis_days < 180:
+        st.warning(
+            "The uploaded period is shorter than 180 days. Annualising a short period can produce "
+            "an unstable payback estimate, especially if vessel operations are seasonal."
+        )
+
+    st.markdown("**Financial assumptions**")
+    capex_usd = st.number_input(
+        "Project CAPEX [US$]",
+        min_value=0.0,
+        value=331_800.0,
+        step=1_000.0,
+        key="payback-capex-usd",
+    )
+
+    option_columns = st.columns(3)
+    with option_columns[0]:
+        charter_duration_years = st.number_input(
+            "Charter duration [years]",
+            min_value=1,
+            max_value=50,
+            value=10,
+            step=1,
+            key="payback-charter-duration",
+            help=(
+                "Enter the period during which the investor receives the fuel-saving benefit. "
+                "Savings after the charter ends are not counted."
+            ),
+        )
+    with option_columns[1]:
+        annual_additional_opex_usd = st.number_input(
+            "Additional annual OPEX [US$]",
+            min_value=0.0,
+            value=0.0,
+            step=1_000.0,
+            key="payback-annual-opex",
+            help="Extra yearly maintenance, servicing or operating cost caused by the project.",
+        )
+    with option_columns[2]:
+        use_manual_saving = st.checkbox(
+            "Override annual fuel saving",
+            value=False,
+            key="payback-manual-saving-toggle",
+            help=(
+                "Use this only when an approved annual fuel-saving estimate should replace "
+                "the annualised FOC-saving result."
+            ),
+        )
+
+    if use_manual_saving:
+        annual_fuel_saving_mt = st.number_input(
+            "Approved annual fuel saving [VLSFO-equivalent MT/year]",
+            min_value=0.0,
+            value=float(calculated_annual_fuel_saving_mt),
+            step=1.0,
+            key="payback-manual-annual-saving",
+        )
+    else:
+        annual_fuel_saving_mt = calculated_annual_fuel_saving_mt
+
+    include_co2_scenarios = st.checkbox(
+        "Include avoided CO2 levy benefit scenarios",
+        value=False,
+        key="payback-include-co2",
+    )
+    if include_co2_scenarios:
+        annual_avoided_co2_cost_usd = st.number_input(
+            "Avoided CO2 levy benefit [US$/year]",
+            min_value=0.0,
+            value=54_197.0,
+            step=1_000.0,
+            key="payback-avoided-co2",
+            help=(
+                "Enter only the portion of the levy avoided because the project reduces emissions, "
+                "not the company's total CO2 levy. The example workbook uses $54,197 because "
+                "$122,909 - $68,712 = $54,197."
+            ),
+        )
+    else:
+        annual_avoided_co2_cost_usd = 0.0
+
+    annual_gross_saving_usd = annual_fuel_saving_mt * fuel_price
+    annual_baseline_net_saving_usd = annual_gross_saving_usd - annual_additional_opex_usd
+
+    if capex_usd <= 0:
+        st.error("Project CAPEX must be greater than zero.")
+        return
+    if annual_baseline_net_saving_usd <= 0:
+        st.error(
+            "Annual net saving is zero or negative. The baseline project cannot achieve payback "
+            "with the current assumptions."
+        )
+
+    cashflow, scenario_summary = build_payback_analysis(
+        capex_usd=capex_usd,
+        annual_gross_fuel_saving_usd=annual_gross_saving_usd,
+        annual_additional_opex_usd=annual_additional_opex_usd,
+        annual_avoided_co2_cost_usd=annual_avoided_co2_cost_usd,
+        charter_duration_years=int(charter_duration_years),
+    )
+
+    baseline = scenario_summary.iloc[0]
+    baseline_payback = baseline["Payback period [years]"]
+    result_columns = st.columns(4)
+    result_columns[0].metric("CAPEX", f"US$ {capex_usd:,.0f}")
+    result_columns[1].metric(
+        "Annual fuel-cost saving before OPEX", f"US$ {annual_gross_saving_usd:,.0f}"
+    )
+    result_columns[2].metric(
+        "Baseline payback",
+        f"{baseline_payback:.2f} years" if pd.notna(baseline_payback) else "No payback",
+    )
+    result_columns[3].metric(
+        "Net surplus at charter end",
+        f"US$ {baseline['Net surplus at charter end [US$]']:,.0f}",
+        help=f"Net saving remaining after CAPEX recovery by the end of the {int(charter_duration_years)}-year charter.",
+    )
+
+    if baseline["Payback within charter"] == "No":
+        st.warning(
+            f"The baseline project does not recover its CAPEX within the "
+            f"{int(charter_duration_years)}-year charter. Unrecovered CAPEX at charter end: "
+            f"US$ {baseline['Unrecovered CAPEX at charter end [US$]']:,.0f}."
+        )
+
+    st.markdown("**Payback and charter-end outcome by scenario**")
+    st.dataframe(
+        scenario_summary.style.format(
+            {
+                "First-year net benefit [US$]": "US$ {:,.0f}",
+                "Payback period [years]": "{:.2f}",
+                "Net surplus at charter end [US$]": "US$ {:,.0f}",
+                "Unrecovered CAPEX at charter end [US$]": "US$ {:,.0f}",
+            },
+            na_rep="No payback",
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.markdown("**Cumulative cash flow over the charter**")
+    figure = px.line(
+        cashflow,
+        x="Year",
+        y="Cumulative cash flow [US$]",
+        color="Scenario",
+        markers=True,
+        title="Cumulative Cash Flow Across the Charter and Break-even",
+    )
+    figure.add_hline(
+        y=0,
+        line_dash="dash",
+        line_color="#ef4444",
+        annotation_text="Break-even",
+        annotation_position="top left",
+    )
+    figure.update_layout(
+        xaxis_title="Charter year",
+        yaxis_title="Cumulative cash flow [US$]",
+        hovermode="x unified",
+        height=480,
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+    )
+    st.plotly_chart(
+        figure,
+        use_container_width=True,
+        key="payback-cumulative-cashflow-chart",
+    )
+
+    with st.expander("Show yearly cash-flow calculation"):
+        st.dataframe(
+            cashflow.style.format(
+                {
+                    "Gross fuel saving [US$]": "{:,.2f}",
+                    "Avoided CO2 levy benefit [US$]": "{:,.2f}",
+                    "Additional OPEX [US$]": "{:,.2f}",
+                    "Net cash flow [US$]": "{:,.2f}",
+                    "Cumulative cash flow [US$]": "{:,.2f}",
+                }
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.download_button(
+            "Download payback cash flow CSV",
+            dataframe_csv(cashflow),
+            "payback_cash_flow.csv",
+            "text/csv",
+            key="payback-cashflow-download",
+        )
+
+    with st.expander("Show formulas and assumptions"):
+        st.code(
+            "Period fuel saving = VLSFO-equivalent consumption x FOC saving assumption %\n"
+            "Annual fuel saving = period fuel saving x 8,760 / analysis hours\n"
+            "Annual gross saving = annual fuel saving x VLSFO reference price\n"
+            "Annual net saving = gross saving + avoided CO2 levy benefit - additional OPEX\n"
+            "Payback = time until cumulative cash flow reaches US$0\n"
+            "Net surplus at charter end = max(total charter net savings - CAPEX, 0)\n"
+            "Unrecovered CAPEX = max(CAPEX - total charter net savings, 0)"
+        )
+        st.caption(
+            "The result inherits the app's VLSFO-equivalent fuel conversion and FOC saving assumption. "
+            "It is an estimate, not a measured retrofit saving."
+        )
+
+    return {
+        "analysis_days": analysis_days,
+        "period_fuel_saving_mt": period_fuel_saving_mt,
+        "annual_fuel_saving_mt": annual_fuel_saving_mt,
+        "annual_saving_overridden": bool(use_manual_saving),
+        "capex_usd": capex_usd,
+        "annual_gross_saving_usd": annual_gross_saving_usd,
+        "annual_additional_opex_usd": annual_additional_opex_usd,
+        "payback_years": (
+            float(baseline_payback) if pd.notna(baseline_payback) else None
+        ),
+        "charter_duration_years": int(charter_duration_years),
+        "payback_within_charter": baseline["Payback within charter"],
+        "net_surplus_usd": float(baseline["Net surplus at charter end [US$]"]),
+        "unrecovered_capex_usd": float(
+            baseline["Unrecovered CAPEX at charter end [US$]"]
+        ),
+    }
+
+
+st.title("Vessel Operating Profile & Payback Analysis")
+st.caption(
+    "Upload Noon, Departure and Arrival reports. Files are identified from their two-row column "
+    "titles - not fixed Excel column positions. The app builds operating-hour profiles, a monthly "
+    "operating summary, an M/E fuel-saving estimate and a charter-period payback analysis."
+)
+
+with st.expander("How file validation works"):
+    st.markdown(
+        """
+        - Each upload slot checks the report's section and column titles before reading data.
+        - A Noon report placed in the Departure slot is rejected as the wrong report type.
+        - Reordered columns are accepted. Deleted required columns are named explicitly and processing stops.
+        - You may upload three separate reports, or upload the same combined workbook in all three slots.
+        """
+    )
+
+upload_columns = st.columns(3)
+with upload_columns[0]:
+    noon_file = st.file_uploader("1. Noon report", type=["xlsx", "xlsm"], key="noon")
+    noon = report_card(noon_file, "noon")
+with upload_columns[1]:
+    departure_file = st.file_uploader("2. Departure report", type=["xlsx", "xlsm"], key="departure")
+    departure = report_card(departure_file, "departure")
+with upload_columns[2]:
+    arrival_file = st.file_uploader("3. Arrival report", type=["xlsx", "xlsm"], key="arrival")
+    arrival = report_card(arrival_file, "arrival")
+
+reports = [noon, departure, arrival]
+if not all(reports):
+    st.stop()
+if any(report.missing for report in reports if report):
+    st.error("Processing stopped because one or more required headers are missing.")
+    st.stop()
+
+try:
+    detected_vessel = validate_vessel_consistency(
+        {"noon": noon, "departure": departure, "arrival": arrival}
+    )
+except VesselValidationError as exc:
+    st.error(str(exc))
+    st.stop()
+st.success(f"Vessel validation passed: {detected_vessel}")
+
+with st.sidebar:
+    st.header("Operating-profile methodology")
+    st.info(
+        "Excel-compatible fixed-bin settings\n\n"
+        "Draft: 7-16 m\n\n"
+        "Speed: 9-24 kn\n\n"
+        "M/E output: 0-22,000 kW\n\n"
+        "Arrival duration: excluded"
+    )
+    known_imo = {"NYK FUTAGO": "9487524"}
+    imo_number = st.text_input(
+        "IMO number",
+        value=known_imo.get(detected_vessel, ""),
+        help="The three downloaded report formats do not contain an IMO-number field, so confirm this once per run.",
+    )
+    foc_saving_percent = st.number_input(
+        "FOC Saving Assumption (%)", 0.0, 100.0, 1.0, 0.1
+    )
+    fuel_price = st.number_input(
+        "VLSFO reference price (US$/MT)", 0.0, 10_000.0, 539.0, 1.0
+    )
+
+data_sum = build_excel_data_sum(noon, departure, arrival)
+segments = profile_segments_from_data_sum(data_sum)
+speed_profile = make_excel_profile(
+    segments, "speed_knots", EXCEL_SPEED_EDGES, "speed_included"
+)
+power_profile = make_excel_profile(
+    segments, "me_output_kw", EXCEL_POWER_EDGES, "power_included"
+)
+monthly = monthly_summary_excel(data_sum)
+if not monthly.empty and "propelling_share_valid" in monthly:
+    invalid_months = monthly.loc[~monthly["propelling_share_valid"], "month"]
+    if not invalid_months.empty:
+        months = ", ".join(invalid_months.dt.strftime("%b %Y"))
+        st.warning(
+            f"Monthly propelling share is unavailable for {months}. Review overlapping "
+            "noon-report intervals or missing time coverage; the app does not cap the value at 100%."
+        )
+overall = excel_overall_summary(data_sum)
+fuel = fuel_consumption_summary(noon, arrival)
+temperature_audit = sea_temperature_audit(data_sum, noon)
+if not temperature_audit["valid"]:
+    st.error(temperature_audit["message"])
+    st.stop()
+
+st.subheader("Calculation Input Summary")
+metrics = st.columns(5)
+valid_duration = segments.loc[segments["duration_hours"].gt(0), "duration_hours"].sum()
+metrics[0].metric("Noon records loaded", f"{len(segments):,}")
+metrics[1].metric("Reported Noon propelling hours", f"{valid_duration:,.1f}")
+metrics[2].metric("Eligible speed-profile hours", f"{speed_profile.total_hours:,.1f}")
+metrics[3].metric("Eligible M/E-profile hours", f"{power_profile.total_hours:,.1f}")
+metrics[4].metric(
+    "Share within displayed M/E bands",
+    f"{power_profile.percent.to_numpy().sum():.2f}%",
+)
+
+tabs = st.tabs(
+    [
+        "Operating Profile & Fuel Saving",
+        "Payback & Charter Outcome",
+        "A4 Professional Report",
+        "Internal Data_sum",
+    ]
+)
+
+with tabs[0]:
+    st.subheader("Speed-Draft Operating Profile")
+    st.caption(
+        "Locked Excel method: draft rows start at 7-16 m and speed columns start at 9-24 kn. "
+        "A label such as 9 means the 9-<10 kn band. Each cell uses the Excel SUMIFS denominator logic."
+    )
+    heatmap(
+        speed_profile,
+        "Distribution of Propelling Hours by Speed and Draft",
+        "Reported speed band start [kn]",
+        "speed-draft-heatmap",
+    )
+    speed_table = render_readable_profile_table(speed_profile)
+    st.download_button(
+        "Download speed profile CSV",
+        dataframe_csv(speed_table, include_index=True),
+        "speed_draft_profile.csv",
+        "text/csv",
+    )
+    with st.expander("Show speed-profile summary"):
+        render_excel_profile_details(
+            speed_profile,
+            "Speed-Draft Profile",
+            detected_vessel,
+            imo_number,
+            overall,
+        )
+
+    st.divider()
+    st.subheader("M/E Output-Draft Operating Profile")
+    st.caption(
+        "Locked Excel method: draft rows start at 7-16 m and M/E output columns start at "
+        "0-22,000 kW. A label such as 1000 means the 1,000-<2,000 kW band. "
+        "Values above the displayed range remain in the denominator exactly as in Excel."
+    )
+    heatmap(
+        power_profile,
+        "Distribution of Propelling Hours by M/E Output and Draft",
+        "Reported M/E output band start [kW]",
+        "me-output-draft-heatmap",
+    )
+    power_table = render_readable_profile_table(power_profile)
+    st.download_button(
+        "Download M/E output profile CSV",
+        dataframe_csv(power_table, include_index=True),
+        "me_output_draft_profile.csv",
+        "text/csv",
+    )
+    with st.expander("Show M/E output-profile summary"):
+        render_excel_profile_details(
+            power_profile,
+            "M/E Output-Draft Profile",
+            detected_vessel,
+            imo_number,
+            overall,
+        )
+
+    st.divider()
+    st.subheader("Monthly Operating Summary")
+    st.caption(
+        "This operating summary is calculated from the internal Data_sum and supplies the three charts. "
+        "It runs from the earliest to latest Noon/Departure/Arrival month."
+    )
+    if monthly.empty:
+        st.warning("No valid dated operating periods are available for the monthly summary.")
+    else:
+        monthly_table = show_excel_monthly_table(monthly)
+        plot_excel_monthly_graphs(monthly_table, "monthly-analysis")
+        st.download_button(
+            "Download monthly operating summary CSV",
+            dataframe_csv(monthly_table),
+            "monthly_operating_summary.csv",
+            "text/csv",
+        )
+    st.divider()
+    render_fuel_summary(
+        fuel=fuel,
+        foc_saving_percent=foc_saving_percent,
+        fuel_price=fuel_price,
+    )
+
+with tabs[1]:
+    payback_result = render_payback_analysis(
+        overall=overall,
+        fuel=fuel,
+        foc_saving_percent=foc_saving_percent,
+        fuel_price=fuel_price,
+    )
+
+with tabs[2]:
+    st.subheader("A4 Professional Report")
+    st.caption(
+        "Create a one-page PDF containing the vessel scope, operating profile, fuel basis, "
+        "assumed saving, commercial outcome and key limitations."
+    )
+    report_columns = st.columns(2)
+    with report_columns[0]:
+        prepared_by = st.text_input(
+            "Prepared by (optional)",
+            value="",
+            max_chars=60,
+            key="report-prepared-by",
+        )
+    with report_columns[1]:
+        management_comment = st.text_input(
+            "Management comment (optional)",
+            value="",
+            max_chars=180,
+            help="Keep this concise so the report remains on one A4 page.",
+            key="report-management-comment",
+        )
+
+    try:
+        report_pdf = build_a4_profile_report(
+            vessel_name=detected_vessel,
+            imo_number=imo_number,
+            overall=overall,
+            noon_records=len(segments),
+            speed_profile=speed_profile,
+            power_profile=power_profile,
+            monthly=monthly,
+            fuel=fuel,
+            foc_saving_percent=foc_saving_percent,
+            fuel_price=fuel_price,
+            payback=payback_result,
+            prepared_by=prepared_by,
+            management_comment=management_comment,
+        )
+    except Exception as exc:
+        st.error(f"The A4 report could not be generated: {exc}")
+    else:
+        st.info(
+            "The report is limited to one A4 page. It identifies the FOC saving as an "
+            "assumption and does not present it as measured retrofit performance."
+        )
+        st.download_button(
+            "Download one-page A4 PDF report",
+            data=report_pdf,
+            file_name=safe_report_filename(detected_vessel),
+            mime="application/pdf",
+            key="download-a4-profile-report",
+            use_container_width=True,
+        )
+
+with tabs[3]:
+    st.caption(
+        "This is the internally created Data_sum calculation-input table. The operating profiles, "
+        "monthly summary and charts are calculated from these records."
+    )
+    displayed_data_sum = excel_data_sum_display(data_sum, imo_number)
+    st.dataframe(displayed_data_sum, hide_index=True, use_container_width=True)
+    st.download_button(
+        "Download internal Data_sum CSV",
+        dataframe_csv(displayed_data_sum),
+        "internal_data_sum.csv",
+        "text/csv",
+    )
