@@ -1,91 +1,592 @@
-"""Self-contained printable HTML, using the same PNG charts and saved result."""
+"""Generate a concise one-page A4 vessel operating-profile report."""
 from __future__ import annotations
 
-from base64 import b64encode
-from html import escape
+import io
+import math
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
+import reportlab
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
 
-from foc_explain import fuel_summary
-from foc_visuals import figure_png, fuel_figure
+
+NAVY = colors.HexColor("#17365D")
+BLUE = colors.HexColor("#2F75B5")
+PALE_BLUE = colors.HexColor("#EAF2F8")
+PALE_GREY = colors.HexColor("#F4F6F8")
+MID_GREY = colors.HexColor("#667085")
+DARK = colors.HexColor("#182230")
+GREEN = colors.HexColor("#217A5B")
+AMBER = colors.HexColor("#9A6700")
+LINE = colors.HexColor("#D0D5DD")
+
+FONT = "ProfileSans"
+FONT_BOLD = "ProfileSans-Bold"
+FONT_ITALIC = "ProfileSans-Italic"
+_FONT_DIRECTORY = Path(reportlab.__file__).parent / "fonts"
+pdfmetrics.registerFont(TTFont(FONT, str(_FONT_DIRECTORY / "Vera.ttf")))
+pdfmetrics.registerFont(TTFont(FONT_BOLD, str(_FONT_DIRECTORY / "VeraBd.ttf")))
+pdfmetrics.registerFont(TTFont(FONT_ITALIC, str(_FONT_DIRECTORY / "VeraIt.ttf")))
 
 
-def printable_report(saved):
-    result, settings = saved["result"], saved["settings"]
-    fuel = fuel_summary(result)
-    if fuel is None or not np.isclose(fuel["saving_pct"], result.get("improvement_pct", np.nan), atol=1e-7, rtol=0):
-        raise ValueError("No reconciled estimate is available for a printable report.")
-    def img(png, alt):
-        return f'<img alt="{escape(alt)}" src="data:image/png;base64,{b64encode(png).decode()}" />'
-    chart = img(figure_png(fuel_figure(fuel)), "Model-expected versus reported fuel over the same post-DD reports")
-    limitations = "".join(f"<li>{escape(str(item))}</li>" for item in result.get("limitations", []))
-    validation = result.get("validation", {})
-    def metric(value):
-        return "Unavailable" if value is None else f"{float(value):.2f}%"
-    sensitivity = result.get("model_sensitivity", pd.DataFrame())
-    sensitivity_html = ""
-    if isinstance(sensitivity, pd.DataFrame) and not sensitivity.empty:
-        sensitivity_html = "<section><h2>ML specification and method sensitivity</h2>"
-        sensitivity_html += f"<p>{escape(str(result.get('model_selection_reason', '')))}</p>"
-        sensitivity_html += sensitivity.to_html(index=False, border=0, float_format=lambda x: f"{x:,.2f}")
-        sensitivity_html += "<p>These values show method sensitivity; they are not a statistical confidence interval and are not additive.</p></section>"
-    method = f"""<section><h2>Chronological prediction validation</h2><p>Unseen-report mean absolute percentage error:
-selected Huber {metric(validation.get('huber', {}).get('mape_pct'))}; public cubic-speed benchmark {metric(validation.get('cubic', {}).get('mape_pct'))}.
-These are prediction errors, not confidence intervals around the saving estimate.</p></section>"""
-    verdict = {
-        "Supported (prototype screening)": "Supported for prototype engineering screening",
-        "Indicative": "Indicative result - use with stated limitations",
-        "Preliminary": "Preliminary result - more comparable evidence required",
-        "Unstable": "Direction-sensitive result - do not interpret the percentage",
-        "Inconclusive": "Inconclusive - model or data not adequate for interpretation",
-    }.get(result.get("evidence_tier"), "Assessment status unavailable")
-    headline = (
-        f"{fuel['saving_pct']:.2f}% calculated difference - not interpretable"
-        if result.get("evidence_tier") in {"Unstable", "Inconclusive"}
-        else f"{fuel['saving_pct']:.2f}% ML-estimated package FOC saving"
+def safe_report_filename(vessel_name: str) -> str:
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", vessel_name.strip()).strip("_")
+    return f"{safe_name or 'vessel'}_operating_profile_report.pdf"
+
+
+def _number(value: Any, decimals: int = 1, suffix: str = "") -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "Not available"
+    if not math.isfinite(number):
+        return "Not available"
+    return f"{number:,.{decimals}f}{suffix}"
+
+
+def _date(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "Not available"
+    timestamp = pd.Timestamp(value)
+    return timestamp.strftime("%d %b %Y")
+
+
+def _wrap_text(text: str, font: str, size: float, width: float) -> list[str]:
+    words = str(text).replace("\n", " \n ").split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        if word == "\n":
+            if current:
+                lines.append(current)
+                current = ""
+            continue
+        trial = word if not current else f"{current} {word}"
+        if stringWidth(trial, font, size) <= width:
+            current = trial
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _draw_wrapped(
+    pdf: canvas.Canvas,
+    text: str,
+    x: float,
+    y: float,
+    width: float,
+    font: str = FONT,
+    size: float = 8.2,
+    leading: float = 10.2,
+    colour= DARK,
+    max_lines: int | None = None,
+) -> float:
+    lines = _wrap_text(text, font, size, width)
+    if max_lines is not None and len(lines) > max_lines:
+        lines = lines[:max_lines]
+        last = lines[-1]
+        while last and stringWidth(last + "...", font, size) > width:
+            last = last[:-1]
+        lines[-1] = last.rstrip() + "..."
+    pdf.setFont(font, size)
+    pdf.setFillColor(colour)
+    for line in lines:
+        pdf.drawString(x, y, line)
+        y -= leading
+    return y
+
+
+def _draw_section_title(pdf: canvas.Canvas, text: str, x: float, y: float) -> None:
+    pdf.setFillColor(NAVY)
+    pdf.setFont(FONT_BOLD, 10.5)
+    pdf.drawString(x, y, text.upper())
+    pdf.setStrokeColor(BLUE)
+    pdf.setLineWidth(1.4)
+    pdf.line(x, y - 4, A4[0] - x, y - 4)
+
+
+def _draw_card(
+    pdf: canvas.Canvas,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    label: str,
+    value: str,
+) -> None:
+    pdf.setFillColor(PALE_GREY)
+    pdf.setStrokeColor(LINE)
+    pdf.roundRect(x, y, width, height, 5, fill=1, stroke=1)
+    pdf.setFillColor(MID_GREY)
+    pdf.setFont(FONT_BOLD, 7.4)
+    pdf.drawString(x + 8, y + height - 15, label.upper())
+    _draw_wrapped(
+        pdf,
+        value,
+        x + 8,
+        y + height - 34,
+        width - 16,
+        font=FONT_BOLD,
+        size=11.2,
+        leading=12,
+        colour=DARK,
+        max_lines=2,
     )
-    comparison_label = {
-        "Strict same-route": "Same-route comparison (preferred)",
-        "Expanded cross-route": "Cross-route comparison (fallback)",
-    }.get(result.get("comparison_basis"), "No usable comparison")
-    sensitivity_range = (
-        f"{result['stability_min_pct']:.2f}% to {result['stability_max_pct']:.2f}%"
-        if result.get("stability_min_pct") is not None and result.get("stability_max_pct") is not None
-        else "Unavailable"
+
+
+def _draw_two_column_rows(
+    pdf: canvas.Canvas,
+    rows: list[tuple[str, str]],
+    x: float,
+    top_y: float,
+    width: float,
+    row_height: float = 22,
+) -> float:
+    column_width = width / 2
+    for index, (label, value) in enumerate(rows):
+        column = index % 2
+        row = index // 2
+        cell_x = x + column * column_width
+        cell_y = top_y - row * row_height
+        pdf.setFillColor(PALE_GREY if row % 2 == 0 else colors.white)
+        pdf.setStrokeColor(LINE)
+        pdf.rect(cell_x, cell_y - row_height + 2, column_width, row_height, fill=1, stroke=1)
+        pdf.setFillColor(MID_GREY)
+        pdf.setFont(FONT, 7.2)
+        pdf.drawString(cell_x + 6, cell_y - 8, label)
+        _draw_wrapped(
+            pdf,
+            value,
+            cell_x + 6,
+            cell_y - 18,
+            column_width - 12,
+            font=FONT_BOLD,
+            size=8.5,
+            leading=9,
+            colour=DARK,
+            max_lines=1,
+        )
+    return top_y - math.ceil(len(rows) / 2) * row_height
+
+
+def _dominant_band(profile, x_width: float, x_unit: str) -> tuple[str, float]:
+    matrix = profile.percent
+    if matrix.empty or not np.isfinite(matrix.to_numpy(dtype=float)).any():
+        return "Not available", 0.0
+    values = matrix.to_numpy(dtype=float)
+    flat_index = int(np.nanargmax(values))
+    row_index, column_index = np.unravel_index(flat_index, values.shape)
+    share = float(values[row_index, column_index])
+    draft_start = float(matrix.index[row_index])
+    x_start = float(matrix.columns[column_index])
+    if x_width >= 100:
+        x_text = f"{x_start:,.0f}-<{x_start + x_width:,.0f} {x_unit}"
+    else:
+        x_text = f"{x_start:g}-<{x_start + x_width:g} {x_unit}"
+    return f"{x_text} / {draft_start:g}-<{draft_start + 1:g} m", share
+
+
+def _draw_profile_distribution(
+    pdf: canvas.Canvas,
+    profile,
+    x: float,
+    top_y: float,
+    width: float,
+    title: str,
+    x_axis_title: str,
+    band_width: float,
+    colour,
+) -> None:
+    """Draw a compact bar graph of propelling-hour share by operating band."""
+    matrix = profile.percent.copy()
+    pdf.setFillColor(DARK)
+    pdf.setFont(FONT_BOLD, 7.8)
+    pdf.drawString(x, top_y, title)
+    if matrix.empty:
+        pdf.setFont(FONT, 7.2)
+        pdf.setFillColor(MID_GREY)
+        pdf.drawString(x, top_y - 18, "No operating-profile data available")
+        return
+
+    totals = matrix.sum(axis=0).astype(float)
+    active = np.where(totals.to_numpy() > 0)[0]
+    if not len(active):
+        pdf.setFont(FONT, 7.2)
+        pdf.setFillColor(MID_GREY)
+        pdf.drawString(x, top_y - 18, "No operating-profile data available")
+        return
+
+    totals = totals.iloc[active[0] : active[-1] + 1]
+    values = totals.to_numpy(dtype=float)
+    maximum = max(float(values.max()), 1.0)
+    y_max = max(10.0, math.ceil(maximum / 10.0) * 10.0)
+    plot_x = x + 28
+    plot_y = top_y - 67
+    plot_width = width - 34
+    plot_height = 48
+
+    pdf.setStrokeColor(colors.HexColor("#D9DEE7"))
+    pdf.setFillColor(MID_GREY)
+    pdf.setFont(FONT, 5.4)
+    for tick in (0, y_max / 2, y_max):
+        tick_y = plot_y + plot_height * tick / y_max
+        pdf.line(plot_x, tick_y, plot_x + plot_width, tick_y)
+        pdf.drawRightString(plot_x - 3, tick_y - 2, f"{tick:.0f}%")
+
+    slot_width = plot_width / max(len(values), 1)
+    bar_width = max(2.0, slot_width * 0.66)
+    pdf.setFillColor(colour)
+    for index, value in enumerate(values):
+        bar_height = plot_height * max(value, 0.0) / y_max
+        bar_x = plot_x + index * slot_width + (slot_width - bar_width) / 2
+        pdf.rect(bar_x, plot_y, bar_width, bar_height, fill=1, stroke=0)
+
+    labels = list(totals.index)
+    label_step = max(1, math.ceil(len(labels) / 6))
+    pdf.setFillColor(MID_GREY)
+    pdf.setFont(FONT, 5.4)
+    for index in range(0, len(labels), label_step):
+        start = float(labels[index])
+        label = f"{start:,.0f}" if band_width >= 100 else f"{start:g}"
+        pdf.drawCentredString(plot_x + (index + 0.5) * slot_width, plot_y - 7, label)
+
+    pdf.setFont(FONT_BOLD, 5.9)
+    pdf.drawCentredString(plot_x + plot_width / 2, plot_y - 15, x_axis_title)
+    pdf.saveState()
+    pdf.translate(x + 7, plot_y + plot_height / 2)
+    pdf.rotate(90)
+    pdf.drawCentredString(0, 0, "Propelling hours (%)")
+    pdf.restoreState()
+
+
+def _draw_monthly_line_chart(
+    pdf: canvas.Canvas,
+    monthly: pd.DataFrame,
+    column: str,
+    x: float,
+    top_y: float,
+    width: float,
+    height: float,
+    title: str,
+    unit: str,
+) -> None:
+    """Draw one compact monthly operating trend graph."""
+    pdf.setFillColor(DARK)
+    pdf.setFont(FONT_BOLD, 7.0)
+    pdf.drawString(x, top_y, title)
+    plot_x = x + 30
+    plot_y = top_y - height + 11
+    plot_width = width - 34
+    plot_height = height - 20
+
+    if monthly.empty or column not in monthly:
+        pdf.setFont(FONT, 6.2)
+        pdf.setFillColor(MID_GREY)
+        pdf.drawString(plot_x, plot_y + plot_height / 2, "No monthly data available")
+        return
+
+    values = pd.to_numeric(monthly[column], errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(values)
+    if not valid.any():
+        pdf.setFont(FONT, 6.2)
+        pdf.setFillColor(MID_GREY)
+        pdf.drawString(plot_x, plot_y + plot_height / 2, "No monthly data available")
+        return
+
+    valid_values = values[valid]
+    lower = float(valid_values.min())
+    upper = float(valid_values.max())
+    padding = max((upper - lower) * 0.15, 1.0 if unit == "%" else 0.5)
+    y_min = max(0.0, lower - padding)
+    y_max = upper + padding
+    if y_max <= y_min:
+        y_max = y_min + 1.0
+
+    pdf.setStrokeColor(colors.HexColor("#D9DEE7"))
+    pdf.setFillColor(MID_GREY)
+    pdf.setFont(FONT, 5.2)
+    for tick in (y_min, (y_min + y_max) / 2, y_max):
+        tick_y = plot_y + plot_height * (tick - y_min) / (y_max - y_min)
+        pdf.line(plot_x, tick_y, plot_x + plot_width, tick_y)
+        pdf.drawRightString(plot_x - 3, tick_y - 2, f"{tick:.0f}{unit}")
+
+    dates = pd.to_datetime(monthly["month"], errors="coerce")
+    count = len(values)
+    points: list[tuple[float, float] | None] = []
+    for index, value in enumerate(values):
+        if not math.isfinite(value):
+            points.append(None)
+            continue
+        point_x = plot_x + (plot_width * index / max(count - 1, 1))
+        point_y = plot_y + plot_height * (value - y_min) / (y_max - y_min)
+        points.append((point_x, point_y))
+
+    pdf.setStrokeColor(BLUE)
+    pdf.setLineWidth(1.25)
+    for first, second in zip(points, points[1:]):
+        if first is not None and second is not None:
+            pdf.line(first[0], first[1], second[0], second[1])
+    pdf.setFillColor(BLUE)
+    for point in points:
+        if point is not None:
+            pdf.circle(point[0], point[1], 1.4, fill=1, stroke=0)
+
+    label_step = max(1, math.ceil(count / 6))
+    pdf.setFillColor(MID_GREY)
+    pdf.setFont(FONT, 5.1)
+    for index in range(0, count, label_step):
+        if pd.isna(dates.iloc[index]):
+            continue
+        label = dates.iloc[index].strftime("%Y/%m")
+        point_x = plot_x + (plot_width * index / max(count - 1, 1))
+        pdf.drawCentredString(point_x, plot_y - 7, label)
+
+
+def build_a4_profile_report(
+    *,
+    vessel_name: str,
+    imo_number: str,
+    overall: dict[str, Any],
+    noon_records: int,
+    speed_profile,
+    power_profile,
+    monthly: pd.DataFrame,
+    fuel: dict[str, Any],
+    foc_saving_percent: float,
+    fuel_price: float,
+    payback: dict[str, Any] | None,
+    prepared_by: str = "",
+    management_comment: str = "",
+) -> bytes:
+    """Return a polished one-page A4 PDF containing the decision-level results."""
+    buffer = io.BytesIO()
+    width, height = A4
+    pdf = canvas.Canvas(buffer, pagesize=A4, pageCompression=1)
+    pdf.setTitle(f"{vessel_name} Operating Profile and Illustrative Retrofit Payback")
+    pdf.setAuthor(prepared_by or "Vessel Operating Profile App")
+
+    margin = 13 * mm
+    content_width = width - 2 * margin
+
+    pdf.setFillColor(NAVY)
+    pdf.rect(0, height - 28 * mm, width, 28 * mm, fill=1, stroke=0)
+    pdf.setFillColor(colors.white)
+    pdf.setFont(FONT_BOLD, 16)
+    pdf.drawString(margin, height - 13 * mm, "Vessel Operating Profile and Illustrative Retrofit Payback")
+    pdf.setFont(FONT, 8.5)
+    pdf.drawString(
+        margin,
+        height - 20 * mm,
+        "Operating profile from noon, departure and arrival reports; commercial inputs are assumptions",
     )
-    demo_notice = (
-        '<div class="demo"><strong>Synthetic demonstration:</strong> This report explains the POC workflow. '
-        'It is not evidence from an actual vessel and must not support a vessel saving claim.</div>'
-        if settings.get("is_demo") else ""
+    pdf.setFont(FONT_BOLD, 7.5)
+    pdf.drawRightString(width - margin, height - 24 * mm, "ILLUSTRATIVE SCENARIO")
+
+    meta_y = height - 35 * mm
+    pdf.setFillColor(DARK)
+    pdf.setFont(FONT_BOLD, 12)
+    pdf.drawString(margin, meta_y, vessel_name or "Vessel name not available")
+    pdf.setFont(FONT, 8.3)
+    pdf.setFillColor(MID_GREY)
+    pdf.drawString(margin, meta_y - 13, f"IMO: {imo_number.strip() or 'Not provided'}")
+    pdf.drawString(
+        margin + 155,
+        meta_y - 13,
+        f"Data period: {_date(overall.get('data_start'))} to {_date(overall.get('data_end'))}",
     )
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{escape(str(settings['vessel']))} - Package-level post-DD FOC assessment V9.11</title><style>
-body{{font:15px/1.5 Arial,sans-serif;color:#172b46;background:#fff;max-width:1000px;margin:32px auto;padding:0 24px}}
-h1{{font-size:28px;margin-bottom:4px}}h2{{font-size:19px}}.meta{{color:#56667a}}.estimate{{font-size:36px;font-weight:700}}
-.scope{{background:#eef4f8;padding:14px;border-left:4px solid #376eaa}}.demo{{background:#fff4dc;padding:14px;border-left:4px solid #9a640e;margin:16px 0}}img{{display:block;width:100%;height:auto}}
-table{{width:100%;border-collapse:collapse;font-size:13px}}th,td{{text-align:left;padding:7px;border-bottom:1px solid #d9e2eb}}
-section{{margin-top:22px}}li{{margin:5px 0}}@media print{{body{{margin:0;max-width:none;padding:0;font-size:11pt}}
-img,table,.scope{{break-inside:avoid}}h2{{break-after:avoid}}@page{{size:A4;margin:15mm}}}}
-</style></head><body><h1>{escape(str(settings['vessel']))} | Package-level post-DD FOC assessment</h1>
-<p class="meta">V9.11 | Dock-in: {escape(str(settings['dock_in']))} | Dock-out: {escape(str(settings['dock_out']))}<br>
-Post-DD assessment endpoint: {escape(str(settings['required_post_end']))} | {escape(str(settings.get('monitoring_basis', '')))}</p>
-{demo_notice}
-<div class="estimate">{escape(headline)}</div>
-<p>Assessment verdict: <strong>{escape(verdict)}</strong>. Positive means reported fuel was lower than model-expected; negative means it was higher.</p>
-<p>Sensitivity direction: <strong>{escape(str(result.get('stability_status', 'Not assessable')))}</strong>. {escape(str(result.get('stability_summary', '')))}</p>
-<p>Sensitivity range: <strong>{escape(sensitivity_range)}</strong>. This is not a statistical confidence interval.</p>
-<p>Operating comparison method: <strong>{escape(comparison_label)}</strong>.</p>
-<p>Selected ML specification: <strong>{escape(str(result.get('selected_ml_model', 'Unavailable')))}</strong>.</p>
-<p>The selected model learned from {result['before_rows']} pre-DD reports. Displacement remains part of the operating-support check even when it is not selected as a prediction term.
-Both totals below use the same {len(fuel['rows'])} comparable reports and {fuel['hours']:,.1f} propelling hours.</p>{chart}
-<p>Calculation: ({fuel['expected']:,.2f} - {fuel['actual']:,.2f}) / {fuel['expected']:,.2f} x 100 = {fuel['saving_pct']:.2f}%.
-Totals are rounded here; the calculation uses full precision.</p>
-<div class="scope">{escape(str(result.get('scope_statement', 'Comparable post-DD reports only.')))}<br>
-Comparable post-DD fuel coverage: {result['coverage_pct']:.1f}%. This is data coverage, not model accuracy.<br>
-Complete service cycle: {'operationally confirmed' if settings.get('service_cycle_confirmed') else 'not confirmed'}.</div>
-<p>This estimates the package-level difference associated with the dry-dock event. It does not isolate individual work items or prove that dry docking alone caused the difference.</p>
-<p>The method follows the general same-vessel, comparable-condition principle associated with ISO 19030, but it does not implement the ISO 19030 default method. The speed/loading support check is not an ISO reference-displacement correction.</p>
-<h2>Limits on interpretation</h2><ul>{limitations}</ul>{sensitivity_html}{method}
-<p class="meta">Local report. No external scripts, images or online services are required. Open in a browser and use Print / Save as PDF.</p>
-</body></html>"""
+    pdf.drawRightString(
+        width - margin,
+        meta_y - 13,
+        f"Prepared: {datetime.now().strftime('%d %b %Y')}",
+    )
+    if prepared_by.strip():
+        pdf.drawRightString(width - margin, meta_y, f"Prepared by: {prepared_by.strip()[:55]}")
+
+    pdf.setFillColor(colors.HexColor("#FFF4D6"))
+    pdf.setStrokeColor(colors.HexColor("#E6B94A"))
+    callout_y = meta_y - 39
+    pdf.roundRect(margin, callout_y, content_width, 22, 4, fill=1, stroke=1)
+    pdf.setFillColor(AMBER)
+    pdf.setFont(FONT_BOLD, 8)
+    pdf.drawString(
+        margin + 8,
+        callout_y + 8,
+        "The fuel saving is an input assumption; this report does not measure post-retrofit performance.",
+    )
+
+    total_hours = float(overall.get("total_hours", 0.0) or 0.0)
+    analysis_days = total_hours / 24 if total_hours > 0 else float("nan")
+    card_y = callout_y - 70
+    card_gap = 6
+    card_width = (content_width - 3 * card_gap) / 4
+    card_values = [
+        ("Elapsed reporting span", _number(analysis_days, 1, " days")),
+        ("Noon reports loaded", f"{int(noon_records):,}"),
+        ("M/E propelling hours", _number(overall.get("propelling_hours"), 1, " h")),
+        ("Assumed fuel saving", _number(foc_saving_percent, 2, "%")),
+    ]
+    for index, (label, value) in enumerate(card_values):
+        _draw_card(
+            pdf,
+            margin + index * (card_width + card_gap),
+            card_y,
+            card_width,
+            56,
+            label,
+            value,
+        )
+
+    speed_band, speed_share = _dominant_band(speed_profile, 1.0, "kn")
+    power_band, power_share = _dominant_band(power_profile, 1_000.0, "kW")
+
+    section_y = card_y - 24
+    _draw_section_title(pdf, "Operating profile", margin, section_y)
+    operating_rows = [
+        ("Mean reported interval STW", _number(overall.get("avg_speed_knots"), 2, " kn")),
+        ("Highest interval-average STW", _number(overall.get("max_noon_speed_knots"), 2, " kn")),
+        ("Propelling hours / elapsed hours", _number(overall.get("working_ratio_pct"), 1, "%")),
+        ("Highest reported main-engine power", _number(overall.get("max_noon_me_output_kw"), 0, " kW")),
+        ("Most frequent STW/draught band", f"{speed_band} ({speed_share:.1f}%)"),
+        ("Most frequent power/draught band", f"{power_band} ({power_share:.1f}%)"),
+    ]
+    table_bottom = _draw_two_column_rows(pdf, operating_rows, margin, section_y - 13, content_width)
+
+    equivalent_fuel = float(fuel.get("total_vlsfo_equivalent_mt", 0.0) or 0.0)
+    raw_fuel = float(fuel.get("total_raw_mt", 0.0) or 0.0)
+    period_saving = equivalent_fuel * foc_saving_percent / 100
+    annual_factor = (365 * 24 / total_hours) if total_hours > 0 else float("nan")
+    annual_cost_saving = period_saving * annual_factor * fuel_price
+    if payback and payback.get("annual_gross_saving_usd") is not None:
+        annual_cost_saving = float(payback["annual_gross_saving_usd"])
+
+    section_y = table_bottom - 18
+    _draw_section_title(pdf, "Main-engine fuel and illustrative saving", margin, section_y)
+    fuel_rows = [
+        ("Reported M/E fuel, all grades", _number(raw_fuel, 2, " t")),
+        ("M/E fuel, VLSFO-energy equivalent", _number(equivalent_fuel, 2, " t")),
+        ("Illustrative period fuel reduction", _number(period_saving, 2, " t equiv.")),
+        ("Illustrative annual fuel-cost saving", f"US$ {_number(annual_cost_saving, 0)}/year"),
+    ]
+    table_bottom = _draw_two_column_rows(pdf, fuel_rows, margin, section_y - 13, content_width)
+
+    section_y = table_bottom - 18
+    _draw_section_title(pdf, "Illustrative commercial outcome", margin, section_y)
+    if payback:
+        payback_value = payback.get("payback_years")
+        payback_text = (
+            _number(payback_value, 2, " years")
+            if payback_value is not None and pd.notna(payback_value)
+            else "No payback under current assumptions"
+        )
+        end_value = float(payback.get("net_surplus_usd", 0.0) or 0.0) - float(
+            payback.get("unrecovered_capex_usd", 0.0) or 0.0
+        )
+        duration = _number(payback.get("charter_duration_years"), 0, " years")
+        commercial_rows = [
+            ("Project CAPEX", f"US$ {_number(payback.get('capex_usd'), 0)}"),
+            ("Simple payback (fuel less OPEX)", payback_text),
+            ("VLSFO reference price", f"US$ {_number(fuel_price, 0)}/t"),
+            ("Additional annual OPEX", f"US$ {_number(payback.get('annual_additional_opex_usd', 0), 0)}/year"),
+            ("Assumed benefit period (charter)", duration),
+            ("Net cash flow less CAPEX (undiscounted)", f"US$ {_number(end_value, 0)}"),
+        ]
+    else:
+        commercial_rows = [
+            ("Commercial calculation", "Not available"),
+            ("Action required", "Enter valid CAPEX and saving assumptions in the Payback tab"),
+        ]
+    table_bottom = _draw_two_column_rows(pdf, commercial_rows, margin, section_y - 13, content_width)
+
+    section_y = table_bottom - 18
+    _draw_section_title(pdf, "Monthly operating trends", margin, section_y)
+    monthly_chart_height = 56
+    chart_top = section_y - 15
+    _draw_monthly_line_chart(
+        pdf, monthly, "working_ratio_pct", margin, chart_top, content_width,
+        monthly_chart_height, "Monthly propelling hours / elapsed hours", "%",
+    )
+    chart_top -= monthly_chart_height + 11
+    _draw_monthly_line_chart(
+        pdf, monthly, "avg_sea_temp_excel", margin, chart_top, content_width,
+        monthly_chart_height, "Monthly mean reported seawater temperature", " °C",
+    )
+    chart_top -= monthly_chart_height + 11
+    _draw_monthly_line_chart(
+        pdf, monthly, "avg_speed_knots", margin, chart_top, content_width,
+        monthly_chart_height, "Monthly mean reported interval STW", " kn",
+    )
+
+    methodology_y = 38
+    invalid_months = (
+        monthly.loc[~monthly["propelling_share_valid"].fillna(False), "month"]
+        if not monthly.empty and "propelling_share_valid" in monthly
+        else pd.Series(dtype="datetime64[ns]")
+    )
+    warnings = (
+        f"Monthly propelling share unavailable for {', '.join(pd.to_datetime(invalid_months).dt.strftime('%b %Y'))}; "
+        "check overlapping reports or missing elapsed-time coverage. "
+        if not invalid_months.empty else ""
+    )
+    override = bool(payback and payback.get("annual_saving_overridden"))
+    source_note = (
+        "Annual cost uses the user-entered annual fuel saving. " if override else
+        "Annual cost scales report-period fuel to 365 days. "
+    )
+    basis_note = (
+        "Band percentages are shares of eligible propelling hours. Main-engine fuel is normalised by lower calorific value "
+        "to a VLSFO energy-equivalent mass; actual grade quantities are separate. "
+        + source_note
+        + "Constant operations, fuel price and OPEX are assumed; discounting and other retrofit costs are excluded. "
+        "D/G, boiler, cylinder oil and non-propelling fuel are excluded. " + warnings
+    )
+    section_y = chart_top - monthly_chart_height - 10
+    if section_y < methodology_y + 85:
+        raise ValueError("A4 report content would overlap the method and limitations box")
+    pdf.setFillColor(PALE_BLUE)
+    pdf.setStrokeColor(LINE)
+    pdf.roundRect(margin, methodology_y, content_width, 78, 4, fill=1, stroke=1)
+    pdf.setFillColor(NAVY)
+    pdf.setFont(FONT_BOLD, 7.4)
+    pdf.drawString(margin + 8, methodology_y + 65, "BASIS AND LIMITATIONS")
+    note_bottom = _draw_wrapped(
+        pdf,
+        basis_note,
+        margin + 8,
+        methodology_y + 53,
+        content_width - 16,
+        size=6.8,
+        leading=8.1,
+        colour=DARK,
+        max_lines=5,
+    )
+    if management_comment.strip():
+        comment_bottom = _draw_wrapped(
+            pdf, f"Comment: {management_comment.strip()}", margin + 8,
+            note_bottom - 1, content_width - 16, font=FONT_ITALIC,
+            size=6.5, leading=7.4, colour=MID_GREY, max_lines=1,
+        )
+        if comment_bottom < methodology_y + 2:
+            raise ValueError("A4 report comment does not fit in the limitations box")
+
+    pdf.setFillColor(MID_GREY)
+    pdf.setFont(FONT, 6.7)
+    pdf.drawString(margin, 24, "Generated by Vessel Operating Profile and Commercial Assessment")
+    pdf.drawRightString(width - margin, 24, "Page 1 of 1")
+
+    pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
