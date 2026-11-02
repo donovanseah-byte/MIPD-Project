@@ -30,7 +30,7 @@ CONCLUSION_GUIDE = pd.DataFrame(
         {
             "Evidence category": "Supported Assessment",
             "Plain-language meaning": "The data, unseen pre-DD prediction checks and operating-condition comparability support interpreting the package-level FOC change, whether positive or negative.",
-            "Appropriate use": "Prototype engineering screening; not proof that dry docking or a particular retrofit caused the change.",
+            "Appropriate use": "Data/model engineering screening only. Verify the post-DD service cycle separately; not proof of a dry-docking or retrofit effect.",
         },
         {
             "Evidence category": "Evidence-Limited",
@@ -71,6 +71,7 @@ ASSESSMENT_FLOW_GUIDE = pd.DataFrame(
         {"Step": "2. Model validity", "Question": "Does the pre-DD model predict unseen data within the declared MAPE, bias and engineering limits?", "Output": "Pass or critical failure"},
         {"Step": "3. Evidence category", "Question": "Can the calculated percentage be interpreted?", "Output": "Supported Assessment, Evidence-Limited or Inconclusive"},
         {"Step": "4. Robustness", "Question": "Do reasonable alternative analyses retain the same direction?", "Output": "Stable or Sensitive"},
+        {"Step": "5. Operational verification", "Question": "Is a complete normal post-DD service cycle independently documented?", "Output": "Confirmed or Pending (separate from reliability grade)"},
     ]
 )
 
@@ -110,10 +111,12 @@ def data_quality_grade(result, settings):
 def assessment_verdict(result):
     grade = evidence_grade(result)
     verdict = {
-        "Supported Assessment": "Supported FOC assessment for prototype engineering screening",
+        "Supported Assessment": "Supported data/model assessment for prototype engineering screening",
         "Evidence-Limited": "Evidence-Limited - interpret cautiously",
         "Inconclusive": "Inconclusive - do not interpret the percentage",
     }[grade]
+    if grade == "Supported Assessment" and result.get("_quality_settings", {}).get("service_cycle_confirmed") is not True:
+        verdict += " | Operational verification pending"
     if robustness_status(result) == "Sensitive":
         verdict += " | Sensitive to reasonable alternative analyses"
     return verdict
@@ -125,7 +128,8 @@ def business_decision(result):
     guidance = {
         "Supported Assessment": (
             "Use the estimate as engineering screening evidence for the stated operating scope. "
-            "Commercial or contractual verification still requires an agreed measurement protocol."
+            "Service-cycle verification is reported separately. Commercial or contractual verification "
+            "still requires an agreed measurement protocol."
         ),
         "Evidence-Limited": (
             "Treat this as a screening indication only. Do not use it alone for an investment, "
@@ -136,6 +140,8 @@ def business_decision(result):
             "operating-comparability requirement before reassessment."
         ),
     }[grade]
+    if grade == "Supported Assessment" and result.get("_quality_settings", {}).get("service_cycle_confirmed") is not True:
+        guidance += " Normal post-DD service-cycle completion remains unverified."
     if robustness_status(result) == "Sensitive":
         guidance += " Investigate why reasonable alternative analyses disagree before making any performance claim."
     if placebo_signal(result)["status"] == "Not separated":
@@ -184,6 +190,8 @@ def plain_language_conclusion(result):
         " The conclusion is limited because " + "; ".join(reasons) + "."
         if reasons else ""
     )
+    if tier == "Supported Assessment" and result.get("_quality_settings", {}).get("service_cycle_confirmed") is not True:
+        reason_text += " The normal post-DD service cycle has not been verified; this is only a supported data/model screening result."
     return tier, effect_text + reason_text
 
 
@@ -237,10 +245,12 @@ def show_assessment_guide(result, settings):
         "The app grades analysis reliability regardless of whether post-DD FOC increased or decreased. Data quality, evidence strength "
         "and robustness are deliberately not combined into one ambiguous label."
     )
-    q1, q2, q3 = st.columns(3)
+    q1, q2, q3, q4 = st.columns(4)
     q1.metric("Current data quality", data_quality_grade(result, settings))
-    q2.metric("Current evidence category", evidence_grade(result))
+    q2.metric("Data/model reliability", evidence_grade(result))
     q3.metric("Current robustness", robustness_status(result))
+    q4.metric("Service-cycle verification", "Confirmed" if settings.get("service_cycle_confirmed") else "Pending")
+    st.caption("Service-cycle verification is reported separately and does not change the numerical reliability tier. An unverified cycle must not be presented as verified.")
     st.markdown("**Assessment sequence**")
     st.dataframe(ASSESSMENT_FLOW_GUIDE, hide_index=True, width="stretch")
     st.markdown("**Data-quality conditions**")
@@ -536,7 +546,10 @@ def show_results(saved):
     tier, conclusion_text = plain_language_conclusion(result)
     conclusion_message = f"**{assessment_verdict(result)}**\n\n{conclusion_text}"
     if tier == "Supported Assessment":
-        st.success(conclusion_message)
+        if settings.get("service_cycle_confirmed") is True:
+            st.success(conclusion_message)
+        else:
+            st.warning(conclusion_message)
     elif tier == "Evidence-Limited":
         st.warning(conclusion_message)
     else:
@@ -547,15 +560,19 @@ def show_results(saved):
     st.write(assignment_summary)
     if assignment_reasons:
         st.markdown("\n".join(f"- {reason}" for reason in assignment_reasons))
-    st.caption("V9.14 reliability grading uses revised, declared prototype thresholds. "
+    st.caption("V9.14 analytical reliability excludes independent service-cycle verification (shown separately). "
                "Previous model classification: " + str(result.get("original_model_evidence_tier", result.get("evidence_tier", "Unavailable"))) + ". "
                "The fuel estimate and underlying validation metrics have not been changed.")
 
     st.info("**Recommended action:** " + business_decision(result))
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4 = st.columns(4)
     d1.metric("Data quality", data_quality_grade(result, settings))
-    d2.metric("Evidence category", evidence_grade(result))
+    d2.metric("Data/model reliability", evidence_grade(result))
     d3.metric("Robustness", robustness_status(result))
+    d4.metric("Operational verification", "Confirmed" if settings.get("service_cycle_confirmed") is True else "Pending")
+    if settings.get("service_cycle_confirmed") is not True:
+        st.warning("A complete normal post-DD service cycle has not been independently confirmed. "
+                   "A Supported Assessment is a data/model screening grade only—not proof of a verified operational saving or penalty.")
     st.caption(
         "Data quality describes the available comparison evidence; evidence category determines "
         "whether the percentage can be interpreted; robustness describes sensitivity to alternative analyses."
@@ -705,6 +722,8 @@ def show_results(saved):
     grade_csv = pd.DataFrame([{
         "Vessel": settings.get("vessel", ""),
         "Reliability tier (V9.14)": grade_report["tier"],
+        "Operational service-cycle verification": grade_report["operational_verification"],
+        "Operational verification note": grade_report["operational_verification_note"],
         "FOC saving (+) / increase (-), %": result.get("improvement_pct"),
         "Pre-DD reports": result.get("before_rows"),
         "Comparable post-DD reports": selected_comparable_rows(result),
