@@ -17,18 +17,19 @@ Browser-ready branch of the Maritime Innovation Project Day (MIPD) package-level
 ## What changed in V9.14
 
 - Separates assessed FOC saving direction from reliability: positive and negative estimates can be **Supported Assessment**.
-- Requires ≥60 eligible pre-DD and ≥20 comparable post-DD reports; ≥60% matched post-DD fuel; MAPE ≤12%; |bias| ≤8%; stable sensitivity direction; confirmed route, service-cycle, period and reporting interval.
+- Requires ≥60 eligible pre-DD and ≥20 comparable post-DD reports; ≥60% matched post-DD fuel; MAPE ≤12%; |bias| ≤8%; stable sensitivity direction; confirmed route, monitoring-period coverage and reporting-interval alignment. Complete normal service-cycle verification is reported separately as Confirmed or Pending and is **not** a data/model reliability gate.
 - At least 10 comparable post-DD reports and 40% matched fuel remain the minimum for an exploratory result.
 - Two-sided placebo-effect magnitude is displayed as a separate effect-distinguishability diagnostic, not a data-quality grading gate.
 - The calculation continues using the vessel-specific pre-DD Huber model and pre-DD operating support; assessment labels are not proof of a causal dry-docking effect.
+- **No target count is hard-coded:** any vessel that passes the declared numerical/operating-comparability checks is Supported for **data/model screening**, whether its FOC estimate is positive or negative. An unconfirmed service cycle must remain labelled **Pending** and limits operational interpretation.
 
 ## Project files
 
-This branch restores the original MIPD noon-report processing and HTML report modules that were accidentally replaced by files from an unrelated Operating Profile app in the default branch. The main default branch is left unchanged.
+This branch restores the original MIPD noon-report processing and HTML report modules that were accidentally replaced by files from an unrelated Operating Profile app in the default branch. The same analytical grading revision is now present on the default branch and this Streamlit branch.
 
 ## Verification
 
-15 V9.14 reliability unit tests passed in the preparation environment. Full Streamlit Community Cloud runtime and integration testing are pending deployment. The eight-vessel comparison is provisional pending verification of operating mappings and service-cycle evidence.
+18 V9.14 reliability unit tests passed in the preparation environment. Full Streamlit Community Cloud runtime and integration testing are pending deployment. A previous independent diagnostics reconstruction produced five conditional Supported data/model candidates, but this **does not establish that the live app generates five**. Confirm the classification by rerunning the eight vessel workbooks in Streamlit with consistent settings. Missing service-cycle proof remains Pending and must not be represented as independently verified.
 
 ## Confidentiality and operational notes
 
