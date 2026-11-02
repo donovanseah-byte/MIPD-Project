@@ -625,6 +625,7 @@ def render_setup():
                         "monitoring_basis": monitoring_basis,
                         "service_cycle_confirmed": service_cycle_confirmed,
                         "period_coverage_ok": period_coverage_ok,
+                        "route_confirmed": route_confirmed,
                         "interval_alignment_confirmed": interval_alignment_confirmed,
                         "min_hours": min_hours,
                         "min_plausible_stw": min_plausible_stw,
