@@ -1,53 +1,35 @@
-# MIPD package-level post-DD FOC assessment - V9.11
+# MIPD V9.14 — Streamlit Community Cloud
 
-V9.11 uses vessel-specific Huber machine learning to estimate package-level post-dry-dock main-engine FOC saving from noon reports. It compares unseen-data prediction performance against a public cubic-speed benchmark, `FOC = a x STW^3`, rather than a company-specific method. The benchmark coefficient is fitted using pre-DD data only and the benchmark is presented as a rule of thumb, not an ISO-prescribed FOC-saving method.
+Browser-ready branch of the Maritime Innovation Project Day (MIPD) package-level post-dry-docking fuel-oil-consumption assessment.
 
-## Run on Windows
+## Run in your browser (no Command Prompt)
 
-Extract the ZIP into a new folder. Open a terminal in the folder containing `app.py` and `requirements.txt`, then run:
+1. Sign in at https://share.streamlit.io with your GitHub account.
+2. Select **Create app** / **Deploy an app** → **From GitHub**.
+3. Select repository: `donovanseah-byte/MIPD-Project`.
+4. Select branch: `mipd-v9-14-streamlit`.
+5. Set the entry-point file to `app.py`.
+6. Select a public or private app as permitted by your company's data policies and deploy.
+7. Use the resulting Streamlit Cloud URL to open the app in a browser.
 
-```text
-py -m pip install -r requirements.txt
-py -m streamlit run app.py
-```
+**Data confidentiality:** Do not commit vessel noon-report workbooks, credentials or company records to GitHub. This repository is public. A hosted Streamlit instance still processes uploaded vessel data on a third-party server; get ONE's express approval before using sensitive company data. For confidential work without cloud approval, run the existing local/offline version instead.
 
-Replace the complete folder rather than only `app.py`; the model, processing, audit, report and export modules changed together.
+## What changed in V9.14
 
-## V9.11 assessment rules
+- Separates assessed FOC saving direction from reliability: positive and negative estimates can be **Supported Assessment**.
+- Requires ≥60 eligible pre-DD and ≥20 comparable post-DD reports; ≥60% matched post-DD fuel; MAPE ≤12%; |bias| ≤8%; stable sensitivity direction; confirmed route, service-cycle, period and reporting interval.
+- At least 10 comparable post-DD reports and 40% matched fuel remain the minimum for an exploratory result.
+- Two-sided placebo-effect magnitude is displayed as a separate effect-distinguishability diagnostic, not a data-quality grading gate.
+- The calculation continues using the vessel-specific pre-DD Huber model and pre-DD operating support; assessment labels are not proof of a causal dry-docking effect.
 
-- Main-engine fuel, LOG distance and propelling hours must cover the same report interval.
-- At least 18 propelling hours.
-- Beaufort 4 or below.
-- A 5-35 kn bound is used only to reject physically implausible steady-sea records.
-- The former fixed 13-25 kn operating filter is not used.
-- Actual speed/loading comparability is learned from valid pre-DD reports using local density in log STW and log displacement.
-- The same confirmed route and operating leg are preferred.
-- If strict evidence does not reach 10 reports and 40% comparable fuel coverage, the app tests an expanded same-leg cross-route comparison.
-- Expanded cross-route results are capped at `Preliminary`.
-- Gross FOC anomalies are visibly flagged but are not silently deleted. The app retrains without flagged reports as a sensitivity check.
-- The selected Huber model is compared with a public cubic-speed benchmark on the same unseen pre-DD reports and comparable post-DD reports.
-- A calculated percentage is classified as Inconclusive when the pre-DD model fails the declared MAPE, bias or learned-speed-exponent validation gates.
-- The conclusion is classified as Unstable when reasonable alternative analyses change the direction between saving and higher FOC.
-- All unsupported or rejected reports remain in the audit and fuel-coverage denominator where applicable.
+## Project files
 
-## App structure
+This branch restores the original MIPD noon-report processing and HTML report modules that were accidentally replaced by files from an unrelated Operating Profile app in the default branch. The main default branch is left unchanged.
 
-1. **Setup** - check the uploaded workbook, confirm operational evidence, review the declared rules and run the assessment.
-2. **Result summary** - presents the conclusion, selected reports, package-level calculation and the checks affecting use.
-3. **Supporting analysis** - provides model validation, same-route/cross-route results, the STW/displacement diagnostic, report audit, methodology and downloads.
+## Verification
 
-The built-in synthetic demonstration contains generated data with an approximately 10% post-DD reduction. It explains the workflow and is not vessel evidence.
+15 V9.14 reliability unit tests passed in the preparation environment. Full Streamlit Community Cloud runtime and integration testing are pending deployment. The eight-vessel comparison is provisional pending verification of operating mappings and service-cycle evidence.
 
-## Interpretation
+## Confidentiality and operational notes
 
-Positive saving means reported post-DD fuel was lower than fuel expected from the selected pre-DD Huber relationship over the same comparable reports and propelling hours. Negative saving means reported fuel was higher.
-
-The result is an observational, steady-at-sea, package-level main-engine FOC estimate. It is not total voyage fuel, proof that dry docking alone caused the difference, certified performance verification, an ISO 19030 calculation, or saving attributed to an individual work item. The overall adjusted-baseline concept is consistent with general measurement-and-verification principles, but the prototype does not claim ISO 50015 certification or conformance.
-
-## Local tests
-
-```text
-py -m unittest discover -p "test*.py" -v
-```
-
-Runtime data remains in the local Streamlit session. The app does not send the uploaded workbook to an external service.
+Do not assume uploads are approved merely because they can be processed. Public app visitors may open the same deployed app. Community Cloud is not a substitute for your organisation's data-handling rules.
