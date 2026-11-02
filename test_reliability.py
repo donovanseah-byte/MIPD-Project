@@ -82,6 +82,23 @@ class TestReliability(unittest.TestCase):
         r['improvement_pct'] = -1.0
         self.assertEqual(placebo_signal(r)['status'], 'Not separated')
 
+    def test_missing_cycle_does_not_demote_analytical_reliability(self):
+        settings = {**SETTINGS, 'service_cycle_confirmed': False}
+        assessment = assess_reliability(RESULT, settings)
+        self.assertEqual(assessment['tier'], 'Supported Assessment')
+        self.assertEqual(assessment['operational_verification'], 'Pending')
+        self.assertIn('not been confirmed', assessment['operational_verification_note'])
+        self.assertEqual(assessment['data_quality'], 'High')
+
+    def test_inadequate_data_still_limited_with_cycle_pending(self):
+        settings = {**SETTINGS, 'service_cycle_confirmed': False}
+        result = {**RESULT, 'supported_after_rows': 11, 'strict_supported_after_rows': 11}
+        self.assertEqual(assess_reliability(result, settings)['tier'], 'Evidence-Limited')
+
+    def test_missing_period_remains_limited_even_if_cycle_pending(self):
+        settings = {**SETTINGS, 'service_cycle_confirmed': False, 'period_coverage_ok': False}
+        self.assertEqual(assess_reliability(RESULT, settings)['tier'], 'Evidence-Limited')
+
     def test_quality_level(self):
         self.assertEqual(quality_level(RESULT, SETTINGS), 'High')
 
