@@ -1,4 +1,4 @@
-"""V9.13 MIPD prototype reliability grading (separate from FOC direction).
+"""V9.14 MIPD data/model reliability and independent operational verification.
 
 This is an experimental *project-defined* grading framework, not an ISO
 performance-verification standard. It does not change the Huber estimate or
@@ -37,7 +37,7 @@ def _rows(result):
 
 
 def quality_level(result, settings):
-    """Quantity, fuel coverage, report alignment and monitoring-period evidence."""
+    """Data quantity and comparability; service-cycle proof is reported separately."""
     min_pre = max(MIN_PRE_DD, int(settings.get("minimum_train_rows") or MIN_PRE_DD))
     pre = int(result.get("before_rows") or 0)
     post = _rows(result)
@@ -50,7 +50,6 @@ def quality_level(result, settings):
             and coverage >= MIN_COVERAGE_SUPPORTED
             and settings.get("interval_alignment_confirmed") is True
             and settings.get("period_coverage_ok") is True
-            and settings.get("service_cycle_confirmed") is True
             and settings.get("route_confirmed") is True):
         return "High"
     return "Limited"
@@ -59,10 +58,21 @@ def quality_level(result, settings):
 def assess_reliability(result, settings):
     """Classify reliability independent of estimated saving sign.
 
-    Returns the three-tier grade plus traceable reasons. Original model-tier
-    gates stay available in result['evidence_tier'] for comparison.
+    Returns the three-tier analytical grade plus independent service-cycle
+    verification status and traceable reasons. Original model-tier gates stay available in result['evidence_tier'] for comparison.
     """
     reasons = []
+    # A complete normal service cycle strengthens operational interpretation,
+    # but its absence alone must not change the grade of the data/model test.
+    # Never infer that a service cycle is verified from calendar coverage.
+    cycle_confirmed = settings.get("service_cycle_confirmed") is True
+    cycle_status = "Confirmed" if cycle_confirmed else "Pending"
+    cycle_note = ("A normal post-DD service cycle was confirmed by the assessor."
+                  if cycle_confirmed else
+                  "Normal post-DD service-cycle completion has not been confirmed; "
+                  "the analytical assessment is not an operationally verified dry-dock effect.")
+    verification = {"operational_verification": cycle_status,
+                    "operational_verification_note": cycle_note}
     validation = result.get("validation") or {}
     huber = validation.get("huber") or {}
     mape = _real(huber.get("mape_pct"))
@@ -94,7 +104,7 @@ def assess_reliability(result, settings):
     if settings.get("interval_alignment_confirmed") is not True:
         critical.append("Alignment of fuel, LOG distance and propelling-hour report intervals is not confirmed.")
     if critical:
-        return {"tier": "Inconclusive", "reasons": critical, "data_quality": quality_level(result, settings)}
+        return {"tier": "Inconclusive", "reasons": critical, "data_quality": quality_level(result, settings), **verification}
 
     if post < MIN_POST_SUPPORTED:
         reasons.append(f"{post} comparable post-DD reports, below the Supported target of {MIN_POST_SUPPORTED}.")
@@ -102,8 +112,6 @@ def assess_reliability(result, settings):
         reasons.append(f"{cov:.1f}% post-DD fuel coverage, below the Supported target of {MIN_COVERAGE_SUPPORTED:.0f}%.")
     if settings.get("period_coverage_ok") is not True:
         reasons.append("The declared monitoring-period coverage has not been confirmed.")
-    if settings.get("service_cycle_confirmed") is not True:
-        reasons.append("A normal post-DD service cycle has not been confirmed.")
     if settings.get("route_confirmed") is not True:
         reasons.append("Route and operating-leg mappings are not confirmed.")
     if result.get("comparison_basis") not in {"Strict same-route", "Expanded cross-route"}:
@@ -121,7 +129,7 @@ def assess_reliability(result, settings):
     tier = "Evidence-Limited" if reasons else "Supported Assessment"
     if not reasons:
         reasons = ["Model validation, minimum matched-data coverage and stable-direction checks passed; the result may represent a saving or higher FOC."]
-    return {"tier": tier, "reasons": reasons, "data_quality": quality_level(result, settings)}
+    return {"tier": tier, "reasons": reasons, "data_quality": quality_level(result, settings), **verification}
 
 
 def placebo_signal(result):
