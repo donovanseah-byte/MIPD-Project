@@ -54,8 +54,24 @@ class TestReliability(unittest.TestCase):
     def test_middle_coverage_limited(self):
         self.assertEqual(self.grade(coverage_pct=59.9), 'Evidence-Limited')
 
-    def test_inadequate_after_reports_limited(self):
-        self.assertEqual(self.grade(supported_after_rows=15,strict_supported_after_rows=15), 'Evidence-Limited')
+    def test_fourteen_comparable_reports_are_limited(self):
+        self.assertEqual(self.grade(supported_after_rows=14, strict_supported_after_rows=14), 'Evidence-Limited')
+
+    def test_fifteen_comparable_reports_are_supported(self):
+        self.assertEqual(self.grade(supported_after_rows=15, strict_supported_after_rows=15), 'Supported Assessment')
+
+    def test_nineteen_comparable_reports_are_supported(self):
+        self.assertEqual(self.grade(supported_after_rows=19, strict_supported_after_rows=19), 'Supported Assessment')
+
+    def test_ten_comparable_reports_still_only_limited(self):
+        self.assertEqual(self.grade(supported_after_rows=10, strict_supported_after_rows=10), 'Evidence-Limited')
+
+    def test_nine_comparable_reports_remain_inconclusive(self):
+        self.assertEqual(self.grade(supported_after_rows=9, strict_supported_after_rows=9), 'Inconclusive')
+
+    def test_data_quality_high_at_fifteen(self):
+        result = {**RESULT, 'supported_after_rows': 15, 'strict_supported_after_rows': 15}
+        self.assertEqual(quality_level(result, SETTINGS), 'High')
 
     def test_legacy_critical_is_preserved(self):
         self.assertEqual(self.grade(evidence_tier='Inconclusive'), 'Inconclusive')
