@@ -241,26 +241,47 @@ def tier_assignment_explanation(result):
 
 
 def show_assessment_guide(result, settings):
-    st.markdown(
-        "The app grades analysis reliability regardless of whether post-DD FOC increased or decreased. Data quality, evidence strength "
-        "and robustness are deliberately not combined into one ambiguous label."
+    """Beginner-readable explanation of the existing assessment rules."""
+    st.write(
+        "The app checks the amount of comparable data, how well the model predicts "
+        "fuel consumption and whether other reasonable analyses agree. "
+        "A Supported Assessment may show either lower or higher fuel consumption."
     )
-    q1, q2, q3, q4 = st.columns(4)
-    q1.metric("Current data quality", data_quality_grade(result, settings))
-    q2.metric("Data/model reliability", evidence_grade(result))
-    q3.metric("Current robustness", robustness_status(result))
-    q4.metric("Service-cycle verification", "Confirmed" if settings.get("service_cycle_confirmed") else "Pending")
-    st.caption("Service-cycle verification is reported separately and does not change the numerical reliability tier. An unverified cycle must not be presented as verified.")
+    g1, g2 = st.columns(2, gap="medium")
+    with g1:
+        with st.container(border=True):
+            st.caption("DATA QUALITY")
+            st.markdown(f"**{data_quality_grade(result, settings)}**")
+            st.write("Are there enough suitable reports to make this comparison?")
+    with g2:
+        with st.container(border=True):
+            st.caption("DATA AND MODEL RELIABILITY")
+            st.markdown(f"**{evidence_grade(result)}**")
+            st.write("Did the report, prediction and comparison checks pass?")
+    g3, g4 = st.columns(2, gap="medium")
+    with g3:
+        with st.container(border=True):
+            st.caption("RESULT STABILITY")
+            st.markdown(f"**{robustness_status(result)}**")
+            st.write("Do other reasonable methods show the same direction of change?")
+    with g4:
+        with st.container(border=True):
+            st.caption("SERVICE-CYCLE VERIFICATION")
+            st.markdown(
+                "**Assessor-confirmed**" if settings.get("service_cycle_confirmed") is True
+                else "**Pending confirmation**"
+            )
+            st.write("Was the vessel's normal route/port rotation verified from records?")
+    st.caption(
+        "The service-cycle check is independent of the data/model grade. "
+        "Neither a Supported grade nor an assessor-confirmed cycle proves the dry dock caused the change."
+    )
     st.markdown("**Assessment sequence**")
     st.dataframe(ASSESSMENT_FLOW_GUIDE, hide_index=True, width="stretch")
     st.markdown("**Data-quality conditions**")
     st.dataframe(DATA_QUALITY_GUIDE, hide_index=True, width="stretch")
     st.markdown("**Evidence-category conditions**")
     st.dataframe(CONCLUSION_GUIDE, hide_index=True, width="stretch")
-    st.caption(
-        "Stable means that reasonable alternative analyses retained the same direction. "
-        "It does not mean that the estimate is accurate. Sensitive means that the direction changed."
-    )
 
 
 def comparison_method_label(result):
@@ -523,207 +544,263 @@ def explain_report(fuel):
 
 
 def show_results(saved):
+    """Beginner-first results: existing FOC calculations and grade rules are unchanged."""
     result, settings = saved["result"], saved["settings"]
-    st.title(f"{settings['vessel']}: Package-level post-dry-dock FOC assessment")
+    vessel = settings.get("vessel") or "Selected vessel"
+    st.title(f"{vessel}: Fuel consumption after dry docking")
     st.caption(
-        f"V9.14 | Dock-in: {settings['dock_in']} | Dock-out: {settings['dock_out']} | "
-        f"Post-DD endpoint: {settings['required_post_end']} | "
-        + settings.get("monitoring_basis", "Selected post-DD period")
+        f"V9.15 interface | V9.14 calculation method | Dry dock: {settings.get('dock_in')} "
+        f"to {settings.get('dock_out')} | Reports assessed through "
+        f"{settings.get('required_post_end')}"
+    )
+    st.write(
+        "The app compares **actual fuel consumption after dry docking** with the "
+        "amount predicted by a model trained on reports from before dry docking, "
+        "under similar operating conditions."
     )
     fuel = fuel_summary(result)
     if not result.get("valid") or fuel is None:
-        st.error(result.get("reason") or "No valid estimate is available.")
-        show_limits(result)
-        st.info("Open Supporting analysis / Reports used and excluded to review the available reports and exclusion reasons.")
+        st.error("The available reports did not produce a usable fuel-consumption estimate.")
+        with st.expander("Why could the assessment not be completed?", expanded=True):
+            st.write(result.get("reason") or "No valid estimate is available.")
+            show_limits(result)
+            st.write("See **Supporting analysis > Reports used and excluded** for details.")
         return
     if not np.isclose(fuel["saving_pct"], result["improvement_pct"], atol=1e-7, rtol=0):
-        st.error("The fuel comparison does not reconcile with the primary estimate. No result is displayed.")
+        st.error("The reported and model-expected fuel totals do not match the headline percentage.")
         return
     if settings.get("is_demo"):
-        st.warning("Synthetic demonstration - this illustrates the workflow and is not evidence from an actual vessel.")
+        st.warning("This is simulated demonstration data, not an actual vessel assessment.")
 
-    st.subheader("1. Assessment conclusion")
-    tier, conclusion_text = plain_language_conclusion(result)
-    conclusion_message = f"**{assessment_verdict(result)}**\n\n{conclusion_text}"
-    if tier == "Supported Assessment":
-        if settings.get("service_cycle_confirmed") is True:
-            st.success(conclusion_message)
-        else:
-            st.warning(conclusion_message)
-    elif tier == "Evidence-Limited":
-        st.warning(conclusion_message)
+    grade = evidence_grade(result)
+    pct = float(result["improvement_pct"])
+    cycle_ok = settings.get("service_cycle_confirmed") is True
+    placebo_status = placebo_signal(result)["status"]
+    direction = "lower" if pct >= 0 else "higher"
+    direction_plain = "less" if pct >= 0 else "more"
+
+    st.subheader("1. What does the result mean?")
+    if grade == "Inconclusive":
+        st.error(
+            "**No reliable FOC change can be reported.** The app calculated a difference, "
+            "but an important data or model check failed. Do not treat it as a saving or deterioration."
+        )
+        with st.expander("See the diagnostic number (not a usable result)"):
+            st.write(f"Calculated difference: {pct:+.2f}%")
     else:
-        st.error(conclusion_message)
-
-    assignment_summary, assignment_reasons = tier_assignment_explanation(result)
-    st.markdown("**Why this conclusion was assigned**")
-    st.write(assignment_summary)
-    if assignment_reasons:
-        st.markdown("\n".join(f"- {reason}" for reason in assignment_reasons))
-    st.caption("V9.14 analytical reliability excludes independent service-cycle verification (shown separately). "
-               "Previous model classification: " + str(result.get("original_model_evidence_tier", result.get("evidence_tier", "Unavailable"))) + ". "
-               "The fuel estimate and underlying validation metrics have not been changed.")
-
-    st.info("**Recommended action:** " + business_decision(result))
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Data quality", data_quality_grade(result, settings))
-    d2.metric("Data/model reliability", evidence_grade(result))
-    d3.metric("Robustness", robustness_status(result))
-    d4.metric("Operational verification", "Confirmed" if settings.get("service_cycle_confirmed") is True else "Pending")
-    if settings.get("service_cycle_confirmed") is not True:
-        st.warning("A complete normal post-DD service cycle has not been independently confirmed. "
-                   "A Supported Assessment is a data/model screening grade only—not proof of a verified operational saving or penalty.")
+        st.markdown(f"### {abs(pct):.2f}% {direction} fuel consumption than expected")
+        st.write(
+            f"Across the comparable reports, the vessel used approximately "
+            f"**{abs(pct):.2f}% {direction_plain} fuel** than the pre-dry-docking model "
+            "predicted. This is an estimate, not proof that dry docking caused the difference."
+        )
+        if grade == "Supported Assessment":
+            st.success(
+                "**Supported Assessment:** The data and model checks support "
+                "interpreting the estimate for initial engineering screening."
+            )
+        else:
+            st.warning(
+                "**Evidence-Limited:** A numerical estimate is available, "
+                "but some supporting evidence is too limited for a stronger conclusion."
+            )
     st.caption(
-        "Data quality describes the available comparison evidence; evidence category determines "
-        "whether the percentage can be interpreted; robustness describes sensitivity to alternative analyses."
-    )
-    with st.expander("How this result was assessed", expanded=False):
-        show_assessment_guide(result, settings)
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("ML-estimated package FOC change", _fmt(result["improvement_pct"], 2, "%"))
-    m2.metric("Post-DD comparison basis", comparison_method_label(result))
-    m3.metric("Eligible post-DD fuel represented", _fmt(result.get("coverage_pct"), 1, "%"))
-    st.caption(
-        "The displayed decimal precision reflects the calculation output and does not represent measurement certainty."
+        "A positive FOC change here means lower fuel consumption than expected. "
+        "A negative value means higher consumption than expected. "
+        "Neither sign by itself establishes cause."
     )
 
-    st.subheader("2. Reports selected for the comparison")
-    st.markdown("**How comparable post-DD reports were selected**")
-    show_comparison_selection(result, settings)
-    st.markdown("**Reports available, eligible and used**")
-    st.dataframe(assessment_data_table(saved), hide_index=True, width="stretch")
-    st.caption(
-        f"The uploaded workbook contained {saved['filter_report']['input_rows']:,} raw reports. "
-        "Reports failing common filters remain available in the Technical Evidence report audit."
-    )
-    common_reasons = main_filter_reasons(saved)
-    if common_reasons:
-        st.caption("Most common operating-filter exclusions: " + "; ".join(common_reasons) + ".")
+    st.subheader("2. How reliable is the assessment?")
+    a, b = st.columns(2, gap="medium")
+    with a:
+        with st.container(border=True):
+            st.caption("DATA QUALITY")
+            st.markdown(f"**{data_quality_grade(result, settings)}**")
+            st.write("Quantity and suitability of available reports.")
+    with b:
+        with st.container(border=True):
+            st.caption("DATA AND MODEL RELIABILITY")
+            st.markdown(f"**{grade}**")
+            st.write("Whether the comparison and prediction checks passed.")
+    c, d = st.columns(2, gap="medium")
+    with c:
+        with st.container(border=True):
+            st.caption("RESULT STABILITY")
+            st.markdown(f"**{robustness_status(result)}**")
+            st.write("Whether alternative analyses retain the same direction.")
+    with d:
+        with st.container(border=True):
+            st.caption("NORMAL SERVICE-CYCLE CHECK")
+            st.markdown("**Assessor-confirmed**" if cycle_ok else "**Pending confirmation**")
+            st.write("Confirmation of the vessel's normal post-dry-docking route/port rotation.")
 
-    st.subheader("3. How the package-level FOC result was calculated")
+    if not cycle_ok:
+        st.warning(
+            "**Still to verify:** The normal post-dry-docking service cycle has not "
+            "been confirmed from operating records. A Supported Assessment applies to "
+            "data/model quality only and is not a verified fuel saving or penalty."
+        )
+    elif not settings.get("service_cycle_evidence_reference"):
+        st.caption(
+            "The service cycle was marked as confirmed, but no supporting reference "
+            "was entered. Independent verification remains outstanding."
+        )
+    else:
+        st.caption(
+            "A service-cycle reference was entered by the assessor. "
+            "The app has not independently checked its authenticity."
+        )
+
+    if placebo_status == "Not separated":
+        st.info(
+            "**Does the difference stand out from normal variation? Not established.** "
+            "Similar-sized changes appeared when the model was tested on historical "
+            "dates without dry docking. Do not claim a verified dry-dock benefit or penalty."
+        )
+    elif placebo_status == "Not assessable":
+        st.caption(
+            "There are not enough historical test-date comparisons to judge whether "
+            "this difference stands out from normal variation."
+        )
+    else:
+        st.caption(
+            "The difference exceeded those seen in the historical test dates. "
+            "This is exploratory evidence, not proof of cause."
+        )
+
+    st.subheader("3. What information was used?")
+    x, y, z = st.columns(3, gap="medium")
+    x.metric("Reports before docking", f"{int(result.get('before_rows') or 0):,}")
+    y.metric("Comparable reports after docking", f"{selected_comparable_rows(result):,}")
+    z.metric("Post-docking fuel covered", _fmt(result.get("coverage_pct"), 1, "%"))
+    st.caption(
+        "'Fuel covered' is the proportion of eligible post-dry-docking fuel "
+        "represented in the reports selected for the comparison."
+    )
+    if result.get("comparison_basis") == "Strict same-route":
+        st.write(
+            "**Comparison: Same route.** The app compares matching service routes "
+            "and operating directions with similar speed and loading."
+        )
+    elif result.get("comparison_basis") == "Expanded cross-route":
+        st.write(
+            "**Comparison: Different routes.** Not enough comparable reports were "
+            "available on the same route, so the app also used reports from other "
+            "routes with similar operating direction, speed and loading. "
+            "Route equivalence still needs confirmation against operating records."
+        )
+    else:
+        st.write("**Comparison:** No suitable route-based comparison was established.")
+
+    with st.expander("Why were some reports excluded?"):
+        show_comparison_selection(result, settings)
+        st.dataframe(assessment_data_table(saved), hide_index=True, width="stretch")
+        st.caption(
+            f"The uploaded workbook had {saved.get('filter_report', {}).get('input_rows', 0):,} raw reports."
+        )
+        common_reasons = main_filter_reasons(saved)
+        if common_reasons:
+            st.write("Main reasons for exclusions: " + "; ".join(common_reasons))
+        st.caption("Excluded reports remain in the audit and are not deleted.")
+
+    st.subheader("4. How is the percentage calculated?")
+    st.markdown(
+        "1. **Learn:** Use suitable pre-dry-docking reports to train a prediction model.\n"
+        "2. **Predict:** Estimate fuel use at each comparable post-dry-docking condition.\n"
+        "3. **Compare:** Compare predicted and reported fuel use over the same intervals."
+    )
     st.image(
         figure_png(assessment_story_figure(fuel, result, assessment_verdict(result))),
         width="stretch",
     )
-    st.markdown("### Technical basis of this calculation")
-
-    selected_features = result.get("numeric_features", [])
-    if "LogDisplacementRatio" in selected_features:
-        prediction_variables = "Speed through water (STW) and displacement"
-    else:
-        prediction_variables = (
-            "Speed through water (STW) only. Displacement is still "
-            "checked when determining operating comparability."
+    with st.expander("Technical calculation details (engineering review)"):
+        features = result.get("numeric_features", [])
+        predictor = (
+            "Speed through water (STW) and displacement"
+            if "LogDisplacementRatio" in features else
+            "Speed through water (STW); displacement is still checked for comparability"
         )
-
-    comparison_basis = result.get("comparison_basis")
-    if comparison_basis == "Strict same-route":
-        comparison_description = (
-            "Same-route comparison: post-DD reports are compared with "
-            "pre-DD data from the same route and operating leg."
+        st.write("**Prediction variables:** " + predictor)
+        st.write("**Model:** Huber regression trained on pre-dry-docking reports.")
+        st.write("**Operating comparison:** " + comparison_method_label(result))
+        st.write(
+            "**Eligibility filters:** At least 18 propelling hours, Beaufort 4 or below, "
+            "valid report intervals and plausible speeds."
         )
-    elif comparison_basis == "Expanded cross-route":
-        comparison_description = (
-            "Expanded cross-route comparison: different routes are used "
-            "because same-route evidence was insufficient. The app retains "
-            "the same operating leg and comparable STW and displacement."
+        st.latex(
+            r"FOC\ saving(\%)="
+            r"\frac{Expected\ fuel-Reported\ fuel}"
+            r"{Expected\ fuel}\times100"
         )
-    else:
-        comparison_description = "No usable operating comparison was available."
-
-    technical_basis = pd.DataFrame(
-        {
-            "Technical item": [
-                "Baseline model",
-                "Prediction variables",
-                "Model selection",
-                "Operating comparison",
-                "Eligibility filters",
-                "Final calculation",
-            ],
-            "Method used": [
-                (
-                    "Huber regression trained using pre-DD noon reports. "
-                    "Huber regression reduces the influence of abnormal reports "
-                    "without automatically deleting them."
-                ),
-                prediction_variables,
-                (
-                    "Candidate ML models are tested on later pre-DD reports "
-                    "that were not used for training. Post-DD results are not "
-                    "used to select the model."
-                ),
-                comparison_description,
-                (
-                    "At least 18 propelling hours, Beaufort 4 or below, "
-                    "valid interval-aligned fuel and LOG distance, and "
-                    "physically plausible STW."
-                ),
-                (
-                    "Expected and reported fuel are calculated over the same "
-                    "comparable post-DD intervals and weighted by propelling hours."
-                ),
-            ],
-        }
-    )
-
-    st.dataframe(
-        technical_basis,
-        hide_index=True,
-        width="stretch",
-    )
-
-    st.latex(
-        r"FOC\ saving(\%)="
-        r"\frac{Expected\ fuel-Reported\ fuel}"
-        r"{Expected\ fuel}\times100"
-    )
-
-    st.caption(
-        "A positive result means reported post-DD fuel was lower than expected. "
-        "A negative result means reported post-DD fuel was higher than expected."
-    )
-
-    st.subheader("4. Checks affecting how the result can be used")
-    validation = result.get("validation", {})
-    sensitivity_low = result.get("stability_min_pct")
-    sensitivity_high = result.get("stability_max_pct")
-    sensitivity_text = (
-        f"{sensitivity_low:.2f}% to {sensitivity_high:.2f}%"
-        if sensitivity_low is not None and sensitivity_high is not None
-        else "Unavailable"
-    )
-    r1, r2, r3, r4 = st.columns(4)
-    r1.metric(
-        "Robustness",
-        robustness_status(result),
-        help="Whether the tested alternatives retain the same saving-or-higher-FOC direction; this does not mean the percentage is unchanged.",
-    )
-    r2.metric("Unseen pre-DD prediction error", _fmt(validation.get("huber", {}).get("mape_pct"), 2, "%"), help="Average percentage error when predicting later pre-dry-dock reports not used for fitting.")
-    r3.metric(
-        "Sensitivity range",
-        sensitivity_text,
-        help="Range across model, route, anomaly and individual-report rechecks; not a confidence interval.",
-    )
-    r4.metric("Gross FOC reports flagged", f"{result.get('flagged_foc_rows', 0)}")
-    st.write("**Operating scope:** " + result.get("scope_statement", "Comparable post-DD reports only."))
-    st.caption("The estimate is package-level. It does not prove causation or assign saving to individual dry-dock work items.")
-
-    with st.expander("Limits behind this conclusion"):
-        show_limits(result)
-        st.caption("The complete decision checklist is available under Supporting analysis / Evidence checks and model reliability.")
-    with st.expander("How individual reports contribute to the overall estimate"):
+        st.code(
+            f"({fuel['expected']:,.2f} - {fuel['actual']:,.2f}) / "
+            f"{fuel['expected']:,.2f} x 100 = {fuel['saving_pct']:.2f}%",
+            language=None,
+        )
+        st.caption("Matched interval fuel amounts are weighted by propelling hours.")
         explain_report(fuel)
-        st.code(f"Overall: ({fuel['expected']:,.2f} - {fuel['actual']:,.2f}) / {fuel['expected']:,.2f} x 100 = {fuel['saving_pct']:.2f}%", language=None)
-        st.caption("Displayed totals are rounded. The calculation uses full precision.")
-    # Original report generator may still use historical tier wording; expose revised grade in separate CSV.
+
+    st.subheader("5. What should I do next?")
+    if grade == "Inconclusive":
+        st.error(
+            "Do not use the percentage in a performance claim. Correct the failed "
+            "data or model check and rerun the assessment."
+        )
+    elif grade == "Evidence-Limited":
+        st.warning(
+            "Collect more comparable reports or resolve the limitations identified "
+            "below before drawing a stronger conclusion."
+        )
+    else:
+        st.write(
+            "This result is suitable for **initial engineering screening**. "
+            "Investment or verified-performance decisions need separate supporting evidence."
+        )
+    if not cycle_ok:
+        st.write("**Next check:** Confirm the service cycle against voyage and port records.")
+    if placebo_status == "Not separated":
+        st.write("**Next check:** Assess whether the change exceeds normal operational variation.")
+
+    with st.expander("Read the full engineering conclusion and validity checks"):
+        tier, detailed_conclusion = plain_language_conclusion(result)
+        st.write("**Detailed interpretation:** " + detailed_conclusion)
+        st.write("**Engineering guidance:** " + business_decision(result))
+        explanation, reasons = tier_assignment_explanation(result)
+        st.write("**Why this grade was assigned:** " + explanation)
+        for reason in reasons:
+            st.write("- " + reason)
+        show_limits(result)
+        val = result.get("validation", {}).get("huber", {})
+        st.write(
+            "Model prediction error (MAPE): " + _fmt(val.get("mape_pct"), 2, "%")
+            + " | Model bias: " + _fmt(val.get("bias_pct"), 2, "%")
+            + " | Stability: " + robustness_status(result)
+        )
+        show_assessment_guide(result, settings)
+
+    with st.expander("Beginner glossary: what do these terms mean?"):
+        st.markdown(
+            "**FOC:** Fuel oil consumption, reported here as energy-adjusted tonnes per day.\n\n"
+            "**Baseline:** Fuel consumption expected from the model trained on earlier reports.\n\n"
+            "**Matched report:** A post-dry-docking report with suitable comparable conditions.\n\n"
+            "**Supported Assessment:** Data and model screening checks passed; fuel savings are not proven.\n\n"
+            "**Robustness:** Whether other reasonable analyses reach the same direction of change.\n\n"
+            "**Service cycle:** The vessel's normal post-dry-docking route and port rotation.\n\n"
+            "**Historical test-date (fake-date) check:** A comparison using dates without dry docking "
+            "to estimate how much variation occurs normally.\n\n"
+            "**Cross-route:** Comparing suitable reports from different routes when same-route reports are insufficient."
+        )
+
     grade_report = assess_reliability(result, settings)
     grade_csv = pd.DataFrame([{
         "Vessel": settings.get("vessel", ""),
-        "Reliability tier (V9.14)": grade_report["tier"],
-        "Operational service-cycle verification": grade_report["operational_verification"],
-        "Operational verification note": grade_report["operational_verification_note"],
+        "Reliability tier (V9.14 rules)": grade_report["tier"],
+        "Operational service-cycle verification": grade_report.get(
+            "operational_verification", "Confirmed" if cycle_ok else "Pending"
+        ),
+        "Operational verification note": grade_report.get(
+            "operational_verification_note", "Assessor-confirmed" if cycle_ok else "Not confirmed"
+        ),
         "FOC saving (+) / increase (-), %": result.get("improvement_pct"),
         "Pre-DD reports": result.get("before_rows"),
         "Comparable post-DD reports": selected_comparable_rows(result),
@@ -731,17 +808,22 @@ def show_results(saved):
         "Chronological MAPE, %": result.get("validation", {}).get("huber", {}).get("mape_pct"),
         "Absolute bias, %": abs(result.get("validation", {}).get("huber", {}).get("bias_pct") or 0),
         "Robustness": robustness_status(result),
-        "Effect signal vs pre-DD fake dates (exploratory)": placebo_signal(result)["status"],
+        "Effect signal vs earlier fake-date tests": placebo_status,
         "Prior model tier": result.get("original_model_evidence_tier", result.get("evidence_tier")),
         "Reasons": "; ".join(grade_report["reasons"]),
     }]).to_csv(index=False)
-    st.download_button("Download V9.14 reliability assessment (CSV)", data=grade_csv,
-                       file_name="mipd_foc_reliability_v9_14.csv", mime="text/csv")
-    st.caption("The printable HTML and technical workbook may include the prior model-tier nomenclature; "
-               "the V9.14 reliability CSV and on-screen conclusion use the revised tier.")
-    st.download_button("Download printable assessment summary (HTML)", data=printable_report(saved),
-                       file_name="mipd_foc_summary_v9_14.html", mime="text/html")
-    st.caption("Open the downloaded summary in a browser and choose Print / Save as PDF.")
+    st.download_button(
+        "Download reliability assessment (CSV)", data=grade_csv,
+        file_name="mipd_foc_reliability_v9_15_interface.csv", mime="text/csv",
+    )
+    st.caption(
+        "The printable HTML and technical workbook may use older grade terminology. "
+        "Use the on-screen grade and reliability CSV for the latest interpretation."
+    )
+    st.download_button(
+        "Download printable assessment (HTML)", data=printable_report(saved),
+        file_name="mipd_foc_summary_v9_15_interface.html", mime="text/html",
+    )
 
 
 def show_checks(saved):
@@ -1000,7 +1082,7 @@ if st.session_state.get("pending_page"):
 if "page" not in st.session_state:
     st.session_state["page"] = "Result summary" if "mipd_v9_11" in st.session_state else "Setup"
 st.sidebar.title("Package-level FOC assessment")
-st.sidebar.caption("V9.14 | Last completed assessment is preserved")
+st.sidebar.caption("V9.15 UI | V9.14 calculation | Last result preserved")
 page = st.sidebar.radio("View", ["Result summary", "Supporting analysis", "Setup"], key="page")
 if page == "Setup":
     render_setup()
