@@ -49,12 +49,12 @@ DATA_QUALITY_GUIDE = pd.DataFrame(
     [
         {
             "Data quality": "High",
-            "Required conditions": "At least 60 valid pre-DD reports, 20 comparable post-DD reports, and 60% comparable post-DD fuel coverage; intervals and monitoring periods verified; operating-leg/route mapping confirmed.",
+            "Required conditions": "At least 60 valid pre-DD reports, 15 comparable post-DD reports, and 60% comparable post-DD fuel coverage; intervals and monitoring periods verified; operating-leg/route mapping confirmed.",
             "Effect on evidence category": "May qualify as Supported Assessment if the predictive model and robustness checks also pass.",
         },
         {
             "Data quality": "Limited",
-            "Required conditions": "At least 60 pre-DD reports, 10–19 comparable post-DD reports or 40–59% coverage, or another non-critical evidence limitation.",
+            "Required conditions": "At least 60 pre-DD reports, 10–14 comparable post-DD reports or 40–59% coverage, or another non-critical evidence limitation.",
             "Effect on evidence category": "Can support only an Evidence-Limited assessment.",
         },
         {
@@ -611,6 +611,7 @@ def show_results(saved):
     )
 
     st.subheader("2. How reliable is the assessment?")
+    st.caption("The Supported report-count threshold is now 15 comparable post-DD reports (previously 20). Other model and data checks still apply.")
     a, b = st.columns(2, gap="medium")
     with a:
         with st.container(border=True):
@@ -1097,7 +1098,7 @@ def show_method(saved):
         equation += f"\nPredicted FOC = {details['smearing_factor']:.4f} x exp(predicted ln(FOC))"
         st.code(equation, language=None)
         st.dataframe(result["coefficients"], hide_index=True, width="stretch")
-    st.caption("Huber settings: epsilon 1.35 and alpha 0.0001. A result is Inconclusive when MAPE exceeds 12%, absolute bias exceeds 8%, validation is unavailable, comparable fuel coverage is below 40%, fewer than 10 comparable post-DD reports are available, or the learned speed exponent falls outside 1.5-4.5. Evidence-Limited is used when a result can be calculated but one or more non-critical supporting requirements are weaker than the Supported standard. At least 20 comparable reports and 60% fuel coverage are required for Supported Assessment; same-route is preferred but a confirmed same-leg cross-route fallback is permitted. These are declared project rules, not IMO, ISO or class requirements.")
+    st.caption("Huber settings: epsilon 1.35 and alpha 0.0001. A result is Inconclusive when MAPE exceeds 12%, absolute bias exceeds 8%, validation is unavailable, comparable fuel coverage is below 40%, fewer than 10 comparable post-DD reports are available, or the learned speed exponent falls outside 1.5-4.5. Evidence-Limited is used when a result can be calculated but one or more non-critical supporting requirements are weaker than the Supported standard. At least 15 comparable reports and 60% fuel coverage are required for Supported Assessment; same-route is preferred but a confirmed same-leg cross-route fallback is permitted. These are declared project rules, not IMO, ISO or class requirements.")
     with st.expander("Method scope and standards reference", expanded=False):
         st.write(
             "This prototype applies the same-vessel and comparable-operating-condition principles commonly "
