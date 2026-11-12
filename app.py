@@ -705,14 +705,91 @@ def show_results(saved):
 
     st.subheader("4. How is the percentage calculated?")
     st.markdown(
-        "1. **Learn:** Use suitable pre-dry-docking reports to train a prediction model.\n"
-        "2. **Predict:** Estimate fuel use at each comparable post-dry-docking condition.\n"
-        "3. **Compare:** Compare predicted and reported fuel use over the same intervals."
+        "1. **Learn:** Train the model on suitable reports from before dry docking.\n"
+        "2. **Predict:** Estimate fuel use under comparable conditions after dry docking.\n"
+        "3. **Compare:** Compare expected and reported fuel over the same periods."
     )
-    st.image(
-        figure_png(assessment_story_figure(fuel, result, assessment_verdict(result))),
-        width="stretch",
+
+    # Native Streamlit cards replace the fixed-width graphic, which clipped
+    # text on narrower screens. All values come from the existing result.
+    predictor = (
+        "STW and displacement"
+        if "LogDisplacementRatio" in result.get("numeric_features", [])
+        else "STW only"
     )
+    selected_model = str(result.get("selected_ml_model") or "Huber regression")
+    comparison_basis = result.get("comparison_basis")
+    if comparison_basis == "Strict same-route":
+        comparison_note = "Same-route comparison"
+    elif comparison_basis == "Expanded cross-route":
+        comparison_note = "Different routes used; operating conditions matched"
+    else:
+        comparison_note = "Comparison basis not established"
+    display_pre = int(result.get("before_rows") or 0)
+    display_post = selected_comparable_rows(result)
+
+    card1, card2, card3 = st.columns(3, gap="medium")
+    with card1:
+        with st.container(border=True):
+            st.caption("STEP 1 | SCREEN")
+            st.markdown("**Reports used**")
+            st.write(f"**{display_pre:,}** pre-dry-docking reports")
+            st.write(f"**{display_post:,}** comparable post-dry-docking reports")
+    with card2:
+        with st.container(border=True):
+            st.caption("STEP 2 | SELECT")
+            st.markdown("**Prediction model**")
+            st.write(selected_model)
+            st.write(predictor)
+            st.caption("Chosen using pre-dry-docking validation.")
+    with card3:
+        with st.container(border=True):
+            st.caption("STEP 3 | PREDICT")
+            st.markdown("**Expected fuel**")
+            st.markdown(f"### {fuel['expected']:,.2f} MT")
+            st.caption("VLSFO-equivalent fuel, based on pre-dry-docking performance.")
+
+    card4, card5 = st.columns(2, gap="medium")
+    with card4:
+        with st.container(border=True):
+            st.caption("STEP 4 | OBSERVE")
+            st.markdown("**Reported fuel**")
+            st.markdown(f"### {fuel['actual']:,.2f} MT")
+            st.caption("VLSFO-equivalent fuel over the same matched periods.")
+    with card5:
+        with st.container(border=True):
+            st.caption("STEP 5 | CONCLUDE")
+            st.markdown("**Estimated FOC change**")
+            if grade == "Inconclusive":
+                st.markdown("### Inconclusive")
+                st.caption(
+                    f"Calculated difference: {pct:+.2f}% (diagnostic only; "
+                    "not a reliable saving or increase)."
+                )
+            else:
+                st.markdown(
+                    f"### {abs(pct):.2f}% {'less' if pct >= 0 else 'more'} fuel"
+                )
+                st.caption(
+                    "Data/model Supported Assessment."
+                    if grade == "Supported Assessment"
+                    else "Evidence-Limited estimate; interpret cautiously."
+                )
+            st.caption(comparison_note)
+
+    st.markdown("**Calculation**")
+    st.latex(r"\text{FOC change (\%)} = \frac{E-A}{E}\times 100")
+    st.caption("E = expected fuel; A = reported fuel. Both totals cover the same comparable periods.")
+    st.write(
+        f"For this vessel: ({fuel['expected']:,.2f} - {fuel['actual']:,.2f}) "
+        f"/ {fuel['expected']:,.2f} x 100 = **{fuel['saving_pct']:+.2f}%**"
+    )
+    st.caption(
+        "Positive = less fuel than expected; negative = more fuel than expected. "
+        "The estimate does not, by itself, prove that dry docking caused the change."
+    )
+    if grade == "Inconclusive":
+        st.warning("This numerical difference is diagnostic only: the reliability checks failed.")
     with st.expander("Technical calculation details (engineering review)"):
         features = result.get("numeric_features", [])
         predictor = (
