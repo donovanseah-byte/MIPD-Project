@@ -1,4 +1,4 @@
-"""V9.14: sign-neutral supported FOC assessment grading."""
+"""V9.15 results UI: sign-neutral assessment with visible report-count threshold."""
 from __future__ import annotations
 
 import json
@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from foc_quality import assess_reliability, quality_level, placebo_signal
+from foc_quality import MIN_POST_SUPPORTED, assess_reliability, quality_level, placebo_signal
 from foc_audit import build_report_ledger, report_comparison
 from foc_explain import fuel_summary, selection_counts
 from foc_exports import (_actual_expected_scatter, _excel_export, _fmt,
@@ -611,7 +611,8 @@ def show_results(saved):
     )
 
     st.subheader("2. How reliable is the assessment?")
-    st.caption("The Supported report-count threshold is now 15 comparable post-DD reports (previously 20). Other model and data checks still apply.")
+    st.caption(f"Active Supported threshold: {MIN_POST_SUPPORTED} comparable post-DD reports. If this still shows 20 after a refresh, the deployment needs restarting.")
+    st.caption(f"Current Supported report-count threshold: {MIN_POST_SUPPORTED} comparable post-DD reports. Other model and data checks still apply.")
     a, b = st.columns(2, gap="medium")
     with a:
         with st.container(border=True):
@@ -872,7 +873,8 @@ def show_results(saved):
     grade_report = assess_reliability(result, settings)
     grade_csv = pd.DataFrame([{
         "Vessel": settings.get("vessel", ""),
-        "Reliability tier (V9.14 rules)": grade_report["tier"],
+        "Reliability tier (current rules)": grade_report["tier"],
+        "Supported minimum comparable post-DD reports": MIN_POST_SUPPORTED,
         "Operational service-cycle verification": grade_report.get(
             "operational_verification", "Confirmed" if cycle_ok else "Pending"
         ),
@@ -1160,7 +1162,7 @@ if st.session_state.get("pending_page"):
 if "page" not in st.session_state:
     st.session_state["page"] = "Result summary" if "mipd_v9_11" in st.session_state else "Setup"
 st.sidebar.title("Package-level FOC assessment")
-st.sidebar.caption("V9.15 UI | V9.14 calculation | Last result preserved")
+st.sidebar.caption(f"V9.15 UI | Supported minimum: {MIN_POST_SUPPORTED} reports | Calculation unchanged")
 page = st.sidebar.radio("View", ["Result summary", "Supporting analysis", "Setup"], key="page")
 if page == "Setup":
     render_setup()
